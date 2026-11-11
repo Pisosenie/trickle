@@ -55,6 +55,9 @@ type session struct {
 	// set before any link starts; nil while only seeding
 	results chan result
 	exits   chan bool
+	found   chan []netip.AddrPort
+
+	pexEvery time.Duration
 
 	mu       sync.Mutex
 	have     peer.Bitfield
@@ -85,6 +88,7 @@ func open(cfg Config) (*session, error) {
 		store:    store,
 		down:     limiter(cfg.DownloadLimit),
 		up:       limiter(cfg.UploadLimit),
+		pexEvery: pexInterval,
 		have:     make(peer.Bitfield, (len(verified)+7)/8),
 		pending:  map[int]work{},
 		fetching: map[int]work{},
@@ -139,10 +143,17 @@ func (s *session) missing() int {
 	return len(s.tf.Pieces) - s.done
 }
 
-func (s *session) register(l *link) {
+// one connection per peer: a second one to the same peer id is refused
+func (s *session) register(l *link) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	for other := range s.links {
+		if other.c.PeerID == l.c.PeerID {
+			return false
+		}
+	}
 	s.links[l] = struct{}{}
+	return true
 }
 
 func (s *session) dropLink(l *link) {
@@ -192,6 +203,7 @@ func Download(ctx context.Context, cfg Config) error {
 
 	s.results = make(chan result)
 	s.exits = make(chan bool)
+	s.found = make(chan []netip.AddrPort, 16)
 	ctx, cancel := context.WithCancel(ctx)
 	var serving, workers sync.WaitGroup
 	defer serving.Wait()
@@ -228,6 +240,8 @@ func Download(ctx context.Context, cfg Config) error {
 			s.downloaded.Add(int64(len(r.data)))
 			s.announceHave(r.index)
 			s.progress()
+		case addrs := <-s.found:
+			launch(addrs)
 		case outgoing := <-s.exits:
 			if outgoing {
 				peers.exited()

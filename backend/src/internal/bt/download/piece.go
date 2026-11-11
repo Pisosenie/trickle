@@ -37,6 +37,7 @@ type pieceProgress struct {
 	received []bool
 	inFlight []bool
 	sentAt   []time.Time
+	lost     []int
 	left     int
 	backlog  int
 	lastData time.Time
@@ -110,8 +111,7 @@ func (p *pieceProgress) block(b peer.Block, now time.Time) (bool, error) {
 func (p *pieceProgress) overtaken(arrivedSentAt, now time.Time) {
 	for j, pending := range p.inFlight {
 		if pending && p.sentAt[j].Before(arrivedSentAt) && now.Sub(p.sentAt[j]) > overtakenAfter {
-			p.inFlight[j] = false
-			p.backlog--
+			p.markLost(j)
 		}
 	}
 }
@@ -119,10 +119,26 @@ func (p *pieceProgress) overtaken(arrivedSentAt, now time.Time) {
 func (p *pieceProgress) expire(now time.Time) {
 	for j, pending := range p.inFlight {
 		if pending && now.Sub(p.sentAt[j]) > requestTimeout {
-			p.inFlight[j] = false
-			p.backlog--
+			p.markLost(j)
 		}
 	}
+}
+
+func (p *pieceProgress) markLost(i int) {
+	p.inFlight[i] = false
+	p.backlog--
+	p.lost = append(p.lost, i)
+}
+
+// a peer may keep a stuck request and drop a repeat as a duplicate, so cancel it first
+func (p *pieceProgress) cancelLost(send func(*peer.Message) error) error {
+	for _, i := range p.lost {
+		if err := send(peer.NewCancel(p.w.index, i*blockSize, p.blockSize(i))); err != nil {
+			return err
+		}
+	}
+	p.lost = nil
+	return nil
 }
 
 func (p *pieceProgress) cancel(send func(*peer.Message) error) {

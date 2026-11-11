@@ -2,6 +2,7 @@ package download
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -10,6 +11,8 @@ import (
 
 	"trickle/internal/bt/peer"
 )
+
+var errDuplicate = errors.New("already connected to this peer")
 
 const (
 	outboxSize = 128
@@ -21,6 +24,10 @@ type link struct {
 	c          *peer.Conn
 	s          *session
 	outgoing   bool
+	addr       netip.AddrPort
+	theirPex   byte
+	lastPex    time.Time
+	shared     map[netip.AddrPort]bool
 	choking    bool
 	interested bool
 	outbox     chan *peer.Message
@@ -28,12 +35,28 @@ type link struct {
 }
 
 // register before the bitfield snapshot; queued haves wait until the bitfield is sent
-func (s *session) newLink(c *peer.Conn, outgoing bool) (*link, error) {
-	l := &link{c: c, s: s, outgoing: outgoing, choking: true, outbox: make(chan *peer.Message, outboxSize)}
+func (s *session) newLink(c *peer.Conn, outgoing bool, addr netip.AddrPort) (*link, error) {
+	l := &link{
+		c:        c,
+		s:        s,
+		outgoing: outgoing,
+		addr:     addr,
+		shared:   map[netip.AddrPort]bool{},
+		choking:  true,
+		outbox:   make(chan *peer.Message, outboxSize),
+	}
 	l.lastSent.Store(time.Now().UnixNano())
-	s.register(l)
+	if !s.register(l) {
+		return nil, errDuplicate
+	}
 	if bf := s.bitfield(); bf.Count() > 0 {
 		if err := l.send(&peer.Message{ID: peer.BitfieldMsg, Payload: bf}); err != nil {
+			s.dropLink(l)
+			return nil, err
+		}
+	}
+	if c.Extensions {
+		if err := l.send(&peer.Message{ID: peer.Extended, Payload: s.extHandshake()}); err != nil {
 			s.dropLink(l)
 			return nil, err
 		}
@@ -63,7 +86,7 @@ func (s *session) dialPeer(ctx context.Context, addr netip.AddrPort) {
 	if err != nil {
 		return
 	}
-	s.runLink(ctx, c, true)
+	s.runLink(ctx, c, true, addr)
 }
 
 func (s *session) acceptPeer(ctx context.Context, nc net.Conn) {
@@ -75,16 +98,19 @@ func (s *session) acceptPeer(ctx context.Context, nc net.Conn) {
 		nc.Close()
 		return
 	}
-	s.runLink(ctx, c, false)
+	s.runLink(ctx, c, false, netip.AddrPort{})
 }
 
 // runLink reads the socket on its own goroutine, so the loop can serve, download and keep time at once
-func (s *session) runLink(ctx context.Context, c *peer.Conn, outgoing bool) {
+func (s *session) runLink(ctx context.Context, c *peer.Conn, outgoing bool, addr netip.AddrPort) {
 	defer c.Close()
+	if c.PeerID == s.cfg.PeerID {
+		return
+	}
 	stop := context.AfterFunc(ctx, func() { c.Close() })
 	defer stop()
 
-	l, err := s.newLink(c, outgoing)
+	l, err := s.newLink(c, outgoing, addr)
 	if err != nil {
 		return
 	}
@@ -161,7 +187,7 @@ func (l *link) loop(ctx context.Context, msgs <-chan *peer.Message, gone <-chan 
 					return
 				}
 				complete, err := cur.block(block, time.Now())
-				if err != nil || l.s.down.WaitN(ctx, len(block.Data)) != nil {
+				if err != nil || cur.cancelLost(l.send) != nil || l.s.down.WaitN(ctx, len(block.Data)) != nil {
 					return
 				}
 				if !complete {
@@ -184,6 +210,9 @@ func (l *link) loop(ctx context.Context, msgs <-chan *peer.Message, gone <-chan 
 		case now := <-ticker.C:
 			if cur != nil {
 				cur.expire(now)
+				if cur.cancelLost(l.send) != nil {
+					return
+				}
 			}
 			if cur != nil && l.s.has(cur.w.index) {
 				cur.cancel(l.send)
@@ -201,6 +230,12 @@ func (l *link) loop(ctx context.Context, msgs <-chan *peer.Message, gone <-chan 
 				}
 			} else {
 				chokedSince = time.Time{}
+			}
+			if l.theirPex != 0 && now.Sub(l.lastPex) >= l.s.pexEvery {
+				l.lastPex = now
+				if m := l.pexMessage(); m != nil && l.send(m) != nil {
+					return
+				}
 			}
 			if now.Sub(time.Unix(0, l.lastSent.Load())) > keepAlive && l.send(nil) != nil {
 				return
@@ -241,6 +276,8 @@ func (l *link) handle(ctx context.Context, m *peer.Message) error {
 		}
 	case peer.Request:
 		return l.serve(ctx, m)
+	case peer.Extended:
+		l.extended(m)
 	}
 	return nil
 }

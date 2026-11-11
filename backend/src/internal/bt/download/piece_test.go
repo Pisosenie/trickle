@@ -10,10 +10,14 @@ import (
 func TestLostRequestsAreAskedAgain(t *testing.T) {
 	w := work{index: 7, length: 4 * blockSize}
 	p := newProgress(w, time.Unix(0, 0))
-	var asked []int
+	var asked, cancelled []int
 	send := func(m *peer.Message) error {
 		req, _ := peer.ParseRequest(m)
-		asked = append(asked, req.Begin/blockSize)
+		if m.ID == peer.Cancel {
+			cancelled = append(cancelled, req.Begin/blockSize)
+		} else {
+			asked = append(asked, req.Begin/blockSize)
+		}
 		return nil
 	}
 	if err := p.request(send); err != nil || len(asked) != 4 {
@@ -33,7 +37,11 @@ func TestLostRequestsAreAskedAgain(t *testing.T) {
 	}
 
 	asked = nil
+	p.cancelLost(send)
 	p.request(send)
+	if len(cancelled) != 2 || cancelled[0] != 0 || cancelled[1] != 1 {
+		t.Fatalf("lost requests must be cancelled before asking again, cancelled %v", cancelled)
+	}
 	if len(asked) != 2 || asked[0] != 0 || asked[1] != 1 {
 		t.Fatalf("expected blocks 0 and 1 again, asked %v", asked)
 	}

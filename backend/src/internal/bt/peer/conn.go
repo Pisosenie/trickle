@@ -109,6 +109,24 @@ func (c *Conn) Apply(m *Message) error {
 	return nil
 }
 
+func (c *Conn) RemoteAddr() netip.AddrPort {
+	tcp, ok := c.nc.RemoteAddr().(*net.TCPAddr)
+	if !ok {
+		return netip.AddrPort{}
+	}
+	ap := tcp.AddrPort()
+	return netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port())
+}
+
+func (c *Conn) LocalAddr() netip.AddrPort {
+	tcp, ok := c.nc.LocalAddr().(*net.TCPAddr)
+	if !ok {
+		return netip.AddrPort{}
+	}
+	ap := tcp.AddrPort()
+	return netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port())
+}
+
 func (c *Conn) SetDeadline(t time.Time) error {
 	return c.nc.SetDeadline(t)
 }

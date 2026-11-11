@@ -325,7 +325,6 @@ func moody(t *testing.T, fx fixture) netip.AddrPort {
 	}
 	t.Cleanup(func() { ln.Close() })
 	data := fx.files["image.iso"]
-	inFlight := min(maxBacklog, pieceLength/blockSize)
 	all := bytes.Repeat([]byte{0xff}, (len(fx.tf.Pieces)+7)/8)
 	go func() {
 		nc, err := ln.Accept()
@@ -339,7 +338,7 @@ func moody(t *testing.T, fx fixture) netip.AddrPort {
 		nc.Write(peer.Handshake{InfoHash: fx.tf.InfoHash, PeerID: [20]byte{'-', 'M', 'O'}}.Bytes())
 		nc.Write((&peer.Message{ID: peer.BitfieldMsg, Payload: all}).Bytes())
 		nc.Write((&peer.Message{ID: peer.Unchoke}).Bytes())
-		requests := 0
+		requests, inFlight := 0, 0
 		for {
 			m, err := peer.ReadMessage(nc)
 			if err != nil {
@@ -348,8 +347,11 @@ func moody(t *testing.T, fx fixture) netip.AddrPort {
 			if m == nil || m.ID != peer.Request {
 				continue
 			}
+			req, _ := peer.ParseRequest(m)
 			requests++
 			if requests == 1 {
+				blocks := int((fx.tf.PieceSize(req.Index) + blockSize - 1) / blockSize)
+				inFlight = min(maxBacklog, blocks)
 				nc.Write((&peer.Message{ID: peer.Choke}).Bytes())
 			}
 			if requests < inFlight {
@@ -359,7 +361,6 @@ func moody(t *testing.T, fx fixture) netip.AddrPort {
 				nc.Write((&peer.Message{ID: peer.Unchoke}).Bytes())
 				continue
 			}
-			req, _ := peer.ParseRequest(m)
 			off := req.Index*pieceLength + req.Begin
 			if _, err := nc.Write(peer.NewPiece(req.Index, req.Begin, data[off:off+req.Length]).Bytes()); err != nil {
 				return
@@ -390,7 +391,9 @@ func ourSeeder(t *testing.T, fx fixture, uploadLimit int64) netip.AddrPort {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		Seed(ctx, Config{Torrent: fx.tf, PeerID: [20]byte{'-', 'S', 'L'}, Dir: fx.src, Listener: ln, UploadLimit: uploadLimit})
+		id := [20]byte{'-', 'S', 'D'}
+		binary.BigEndian.PutUint16(id[3:], uint16(ln.Addr().(*net.TCPAddr).Port))
+		Seed(ctx, Config{Torrent: fx.tf, PeerID: id, Dir: fx.src, Listener: ln, UploadLimit: uploadLimit})
 	}()
 	t.Cleanup(func() {
 		cancel()
@@ -402,10 +405,11 @@ func ourSeeder(t *testing.T, fx fixture, uploadLimit int64) netip.AddrPort {
 func TestEndgameDoesNotWaitForSlowPeer(t *testing.T) {
 	fx := buildFixture(t, "image.iso", 512<<10, map[string][]byte{"image.iso": randomBytes(2 << 20)})
 	slow := ourSeeder(t, fx, 64<<10)
+	fast := ourSeeder(t, fx, 0)
 	more := make(chan []netip.AddrPort, 1)
 	go func() {
 		time.Sleep(300 * time.Millisecond)
-		more <- []netip.AddrPort{seed(t, fx)}
+		more <- []netip.AddrPort{fast}
 	}()
 
 	out := t.TempDir()
