@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Trickle</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main>
+  <h1>Trickle</h1>
+  <p id="banner" class="banner" hidden></p>
+
+  <form id="magnet-form">
+    <label for="magnet">Magnet link</label>
+    <textarea id="magnet" rows="4" placeholder="magnet:?xt=urn:btih:..." required></textarea>
+    <button type="submit">Send to Deck</button>
+  </form>
+
+  <form id="file-form">
+    <label for="file">or a .torrent file</label>
+    <input id="file" type="file" accept=".torrent,application/x-bittorrent" required>
+    <button type="submit">Upload</button>
+  </form>
+
+  <h2>Downloads</h2>
+  <ul id="list"></ul>
+</main>
+<script src="app.js"></script>
+</body>
+</html>

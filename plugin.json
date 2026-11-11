@@ -1,0 +1,11 @@
+{
+  "name": "Trickle",
+  "author": "Danil Zorin",
+  "flags": [],
+  "api_version": 1,
+  "publish": {
+    "tags": ["downloads", "network", "bittorrent"],
+    "description": "BitTorrent downloads from Gaming Mode. Pauses while you play, respects your battery, and takes magnet links from your phone via QR code.",
+    "image": ""
+  }
+}
