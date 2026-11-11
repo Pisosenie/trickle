@@ -60,6 +60,8 @@ type session struct {
 	pexEvery     time.Duration
 	rechokeEvery time.Duration
 
+	full peer.Bitfield
+
 	mu       sync.Mutex
 	have     peer.Bitfield
 	done     int
@@ -91,6 +93,7 @@ func open(cfg Config) (*session, error) {
 		up:           limiter(cfg.UploadLimit),
 		pexEvery:     pexInterval,
 		rechokeEvery: rechokeInterval,
+		full:         peer.Full(len(cfg.Torrent.Pieces)),
 		have:         make(peer.Bitfield, (len(verified)+7)/8),
 		pending:      map[int]work{},
 		fetching:     map[int]work{},
@@ -119,6 +122,21 @@ func (s *session) bitfield() peer.Bitfield {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return slices.Clone(s.have)
+}
+
+// a fast peer hears exactly one of bitfield, have all or have none; others only a non-empty bitfield
+func (s *session) announcement(fast bool) *peer.Message {
+	bf := s.bitfield()
+	n := bf.Count()
+	switch {
+	case fast && n == len(s.tf.Pieces):
+		return &peer.Message{ID: peer.HaveAll}
+	case fast && n == 0:
+		return &peer.Message{ID: peer.HaveNone}
+	case n == 0:
+		return nil
+	}
+	return &peer.Message{ID: peer.BitfieldMsg, Payload: bf}
 }
 
 func (s *session) has(index int) bool {

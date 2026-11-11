@@ -1,6 +1,9 @@
 package peer
 
-import "math/bits"
+import (
+	"math/bits"
+	"slices"
+)
 
 type Bitfield []byte
 
@@ -26,4 +29,20 @@ func (b Bitfield) Count() int {
 		n += bits.OnesCount8(c)
 	}
 	return n
+}
+
+func Full(pieces int) Bitfield {
+	b := make(Bitfield, (pieces+7)/8)
+	for i := range pieces {
+		b[i/8] |= 1 << (7 - i%8)
+	}
+	return b
+}
+
+func (b Bitfield) Minus(other Bitfield) Bitfield {
+	next := slices.Clone(b)
+	for i := range min(len(next), len(other)) {
+		next[i] &^= other[i]
+	}
+	return next
 }

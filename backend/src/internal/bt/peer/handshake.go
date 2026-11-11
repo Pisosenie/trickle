@@ -13,7 +13,10 @@ const (
 
 var ErrProtocol = errors.New("peer protocol error")
 
-const extensionByte, extensionBit = 5, 0x10
+const (
+	extensionByte, extensionBit = 5, 0x10
+	fastByte, fastBit           = 7, 0x04
+)
 
 type Handshake struct {
 	Reserved [8]byte

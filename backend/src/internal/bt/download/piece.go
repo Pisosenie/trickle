@@ -15,6 +15,7 @@ const (
 	pieceTimeout   = 30 * time.Second
 	overtakenAfter = time.Second
 	requestTimeout = 15 * time.Second
+	maxRefusals    = 3
 )
 
 var errHashMismatch = errors.New("piece failed SHA-1 check")
@@ -32,27 +33,30 @@ type result struct {
 }
 
 type pieceProgress struct {
-	w        work
-	buf      []byte
-	received []bool
-	inFlight []bool
-	sentAt   []time.Time
-	lost     []int
-	left     int
-	backlog  int
-	lastData time.Time
+	w         work
+	buf       []byte
+	received  []bool
+	inFlight  []bool
+	sentAt    []time.Time
+	lost      []int
+	cancelled []int
+	refusals  int
+	left      int
+	backlog   int
+	lastData  time.Time
 }
 
 func newProgress(w work, now time.Time) *pieceProgress {
 	blocks := (w.length + blockSize - 1) / blockSize
 	return &pieceProgress{
-		w:        w,
-		buf:      make([]byte, w.length),
-		received: make([]bool, blocks),
-		inFlight: make([]bool, blocks),
-		sentAt:   make([]time.Time, blocks),
-		left:     blocks,
-		lastData: now,
+		w:         w,
+		buf:       make([]byte, w.length),
+		received:  make([]bool, blocks),
+		inFlight:  make([]bool, blocks),
+		sentAt:    make([]time.Time, blocks),
+		cancelled: make([]int, blocks),
+		left:      blocks,
+		lastData:  now,
 	}
 }
 
@@ -136,9 +140,28 @@ func (p *pieceProgress) cancelLost(send func(*peer.Message) error) error {
 		if err := send(peer.NewCancel(p.w.index, i*blockSize, p.blockSize(i))); err != nil {
 			return err
 		}
+		p.cancelled[i]++
 	}
 	p.lost = nil
 	return nil
+}
+
+// a fast peer answers our cancel with a reject too; that one must not free the block asked for again
+func (p *pieceProgress) rejected(r peer.BlockRequest) bool {
+	i := r.Begin / blockSize
+	if r.Index != p.w.index || r.Begin%blockSize != 0 || i < 0 || i >= len(p.inFlight) {
+		return false
+	}
+	if p.cancelled[i] > 0 {
+		p.cancelled[i]--
+		return false
+	}
+	if !p.inFlight[i] {
+		return false
+	}
+	p.inFlight[i] = false
+	p.backlog--
+	return true
 }
 
 func (p *pieceProgress) cancel(send func(*peer.Message) error) {

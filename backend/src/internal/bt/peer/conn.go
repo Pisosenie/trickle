@@ -12,8 +12,10 @@ type Conn struct {
 	nc         net.Conn
 	PeerID     [20]byte
 	Bitfield   Bitfield
+	All        bool
 	Choked     bool
 	Extensions bool
+	Fast       bool
 }
 
 func Dial(ctx context.Context, addr netip.AddrPort, infoHash, peerID [20]byte) (*Conn, error) {
@@ -46,6 +48,7 @@ func exchange(ctx context.Context, nc net.Conn, infoHash, peerID [20]byte, diale
 	}
 	hs := Handshake{InfoHash: infoHash, PeerID: peerID}
 	hs.Reserved[extensionByte] |= extensionBit
+	hs.Reserved[fastByte] |= fastBit
 	ours := hs.Bytes()
 	if dialed {
 		if _, err := nc.Write(ours); err != nil {
@@ -69,6 +72,7 @@ func exchange(ctx context.Context, nc net.Conn, infoHash, peerID [20]byte, diale
 		PeerID:     theirs.PeerID,
 		Choked:     true,
 		Extensions: theirs.Reserved[extensionByte]&extensionBit != 0,
+		Fast:       theirs.Reserved[fastByte]&fastBit != 0,
 	}, nil
 }
 
@@ -92,6 +96,9 @@ func (c *Conn) Receive() (*Message, error) {
 }
 
 func (c *Conn) Apply(m *Message) error {
+	if !c.Fast && m.ID >= Suggest && m.ID <= AllowedFast {
+		return fmt.Errorf("%w: %v without the fast extension", ErrProtocol, m.ID)
+	}
 	switch m.ID {
 	case Choke:
 		c.Choked = true
@@ -99,6 +106,12 @@ func (c *Conn) Apply(m *Message) error {
 		c.Choked = false
 	case BitfieldMsg:
 		c.Bitfield = Bitfield(m.Payload)
+		c.All = false
+	case HaveAll:
+		c.All = true
+	case HaveNone:
+		c.All = false
+		c.Bitfield = nil
 	case Have:
 		index, err := ParseHave(m)
 		if err != nil {
@@ -107,6 +120,10 @@ func (c *Conn) Apply(m *Message) error {
 		c.Bitfield = c.Bitfield.With(index)
 	}
 	return nil
+}
+
+func (c *Conn) Has(index int) bool {
+	return c.All || c.Bitfield.Has(index)
 }
 
 func (c *Conn) RemoteAddr() netip.AddrPort {

@@ -30,6 +30,7 @@ type link struct {
 	shared     map[netip.AddrPort]bool
 	choking    bool
 	interested bool
+	refused    peer.Bitfield
 	outbox     chan *peer.Message
 	lastSent   atomic.Int64
 
@@ -54,8 +55,8 @@ func (s *session) newLink(c *peer.Conn, outgoing bool, addr netip.AddrPort) (*li
 	if !s.register(l) {
 		return nil, errDuplicate
 	}
-	if bf := s.bitfield(); bf.Count() > 0 {
-		if err := l.send(&peer.Message{ID: peer.BitfieldMsg, Payload: bf}); err != nil {
+	if m := s.announcement(c.Fast); m != nil {
+		if err := l.send(m); err != nil {
 			s.dropLink(l)
 			return nil, err
 		}
@@ -168,7 +169,7 @@ func (l *link) loop(ctx context.Context, msgs <-chan *peer.Message, gone <-chan 
 				return
 			}
 			if cur == nil && l.interested && !l.c.Choked {
-				if w, ok := l.s.assign(l.c.Bitfield); ok {
+				if w, ok := l.s.assign(l.theirs()); ok {
 					cur = newProgress(w, time.Now())
 				}
 			}
@@ -188,7 +189,23 @@ func (l *link) loop(ctx context.Context, msgs <-chan *peer.Message, gone <-chan 
 			}
 			switch m.ID {
 			case peer.Choke:
-				cur.choked()
+				if !l.c.Fast {
+					cur.choked()
+				}
+			case peer.Reject:
+				req, err := peer.ParseRequest(m)
+				if err != nil {
+					return
+				}
+				if !cur.rejected(req) || l.c.Choked {
+					continue
+				}
+				if cur.refusals++; cur.refusals > maxRefusals {
+					cur.cancel(l.send)
+					l.refused = l.refused.With(cur.w.index)
+					l.s.release(cur.w, !cur.w.duplicate)
+					cur = nil
+				}
 			case peer.Piece:
 				block, err := peer.ParsePiece(m)
 				if err != nil {
@@ -272,8 +289,19 @@ func (l *link) syncChoke() error {
 	return l.send(&peer.Message{ID: id})
 }
 
+func (l *link) theirs() peer.Bitfield {
+	bf := l.c.Bitfield
+	if l.c.All {
+		bf = l.s.full
+	}
+	if l.refused == nil {
+		return bf
+	}
+	return bf.Minus(l.refused)
+}
+
 func (l *link) updateInterest() error {
-	want := l.s.wants(l.c.Bitfield)
+	want := l.s.wants(l.theirs())
 	if want == l.interested {
 		return nil
 	}
@@ -304,18 +332,17 @@ func (l *link) handle(ctx context.Context, m *peer.Message) error {
 }
 
 func (l *link) serve(ctx context.Context, m *peer.Message) error {
-	if l.choking {
-		return nil
-	}
 	req, err := peer.ParseRequest(m)
 	if err != nil {
 		return err
 	}
 	tf := l.s.tf
-	if req.Index < 0 || req.Index >= len(tf.Pieces) || !l.s.has(req.Index) ||
-		req.Length <= 0 || req.Length > maxRequest || req.Begin < 0 ||
-		int64(req.Begin+req.Length) > tf.PieceSize(req.Index) {
+	if req.Index < 0 || req.Index >= len(tf.Pieces) || req.Length <= 0 || req.Length > maxRequest ||
+		req.Begin < 0 || int64(req.Begin+req.Length) > tf.PieceSize(req.Index) {
 		return fmt.Errorf("%w: bad request for %d@%d+%d", peer.ErrProtocol, req.Index, req.Begin, req.Length)
+	}
+	if l.choking || !l.s.has(req.Index) {
+		return l.refuse(req)
 	}
 	data := make([]byte, req.Length)
 	if err := l.s.store.ReadAt(data, int64(req.Index)*tf.PieceLength+int64(req.Begin)); err != nil {
@@ -327,4 +354,15 @@ func (l *link) serve(ctx context.Context, m *peer.Message) error {
 	l.s.uploaded.Add(int64(len(data)))
 	l.sent.Add(int64(len(data)))
 	return l.send(peer.NewPiece(req.Index, req.Begin, data))
+}
+
+// without the fast extension a choked request is dropped silently and one for a missing piece is a violation
+func (l *link) refuse(req peer.BlockRequest) error {
+	switch {
+	case l.c.Fast:
+		return l.send(peer.NewReject(req.Index, req.Begin, req.Length))
+	case l.choking:
+		return nil
+	}
+	return fmt.Errorf("%w: request for missing piece %d", peer.ErrProtocol, req.Index)
 }

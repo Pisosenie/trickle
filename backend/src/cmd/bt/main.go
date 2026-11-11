@@ -143,8 +143,15 @@ func hello(addr netip.AddrPort, tf torrentfile.File, peerID [20]byte) probe {
 
 	have := "sent no bitfield"
 	c.SetDeadline(time.Now().Add(3 * time.Second))
-	if m, err := c.Read(); err == nil && m != nil && m.ID == peer.BitfieldMsg {
-		have = fmt.Sprintf("has %d of %d pieces", c.Bitfield.Count(), len(tf.Pieces))
+	if m, err := c.Read(); err == nil && m != nil {
+		switch m.ID {
+		case peer.BitfieldMsg:
+			have = fmt.Sprintf("has %d of %d pieces", c.Bitfield.Count(), len(tf.Pieces))
+		case peer.HaveAll:
+			have = fmt.Sprintf("has all %d pieces", len(tf.Pieces))
+		case peer.HaveNone:
+			have = "has nothing yet"
+		}
 	}
 	return probe{line: fmt.Sprintf("%-40s  %s  %s", addr, clientName(c.PeerID), have), ok: true}
 }

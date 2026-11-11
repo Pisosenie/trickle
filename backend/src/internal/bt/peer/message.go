@@ -18,7 +18,12 @@ const (
 	Request
 	Piece
 	Cancel
-	Extended ID = 20
+	Suggest     ID = 13
+	HaveAll     ID = 14
+	HaveNone    ID = 15
+	Reject      ID = 16
+	AllowedFast ID = 17
+	Extended    ID = 20
 )
 
 func (id ID) String() string {
@@ -26,7 +31,18 @@ func (id ID) String() string {
 	if int(id) < len(names) {
 		return names[id]
 	}
-	if id == Extended {
+	switch id {
+	case Suggest:
+		return "suggest"
+	case HaveAll:
+		return "have all"
+	case HaveNone:
+		return "have none"
+	case Reject:
+		return "reject"
+	case AllowedFast:
+		return "allowed fast"
+	case Extended:
 		return "extended"
 	}
 	return fmt.Sprintf("unknown(%d)", uint8(id))
@@ -114,7 +130,7 @@ type BlockRequest struct {
 }
 
 func ParseRequest(m *Message) (BlockRequest, error) {
-	if (m.ID != Request && m.ID != Cancel) || len(m.Payload) != 12 {
+	if (m.ID != Request && m.ID != Cancel && m.ID != Reject) || len(m.Payload) != 12 {
 		return BlockRequest{}, fmt.Errorf("%w: malformed request", ErrProtocol)
 	}
 	return BlockRequest{
@@ -133,4 +149,8 @@ func NewPiece(index, begin int, data []byte) *Message {
 
 func NewCancel(index, begin, length int) *Message {
 	return &Message{ID: Cancel, Payload: NewRequest(index, begin, length).Payload}
+}
+
+func NewReject(index, begin, length int) *Message {
+	return &Message{ID: Reject, Payload: NewRequest(index, begin, length).Payload}
 }

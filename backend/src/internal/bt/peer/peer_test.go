@@ -124,6 +124,28 @@ func TestAcceptAnswersOnlyMatchingTorrent(t *testing.T) {
 	}
 }
 
+func TestFastExtensionMessages(t *testing.T) {
+	rej, err := ParseRequest(NewReject(3, 16384, 16384))
+	if err != nil || rej != (BlockRequest{Index: 3, Begin: 16384, Length: 16384}) {
+		t.Fatalf("reject: %+v, %v", rej, err)
+	}
+	if HaveAll.String() != "have all" || Reject.String() != "reject" {
+		t.Fatal("fast extension message names")
+	}
+	plain := &Conn{}
+	if err := plain.Apply(&Message{ID: HaveAll}); !errors.Is(err, ErrProtocol) {
+		t.Fatalf("have all from a peer without the fast bit should be a protocol error, got %v", err)
+	}
+	dialer, acceptor := net.Pipe()
+	defer dialer.Close()
+	defer acceptor.Close()
+	go Accept(context.Background(), acceptor, testHash, [20]byte{'-', 'S', 'D'})
+	c, err := handshake(context.Background(), dialer, testHash, testID)
+	if err != nil || !c.Fast || !c.Extensions {
+		t.Fatalf("both sides advertise the fast extension: fast=%v ext=%v err=%v", c != nil && c.Fast, c != nil && c.Extensions, err)
+	}
+}
+
 func TestBitfield(t *testing.T) {
 	b := Bitfield{0b1010_0000}
 	if !b.Has(0) || b.Has(1) || !b.Has(2) || b.Has(9) || b.Has(-1) {
@@ -132,6 +154,14 @@ func TestBitfield(t *testing.T) {
 	grown := b.With(9)
 	if !grown.Has(9) || b.Has(9) || len(b) != 1 || grown.Count() != 3 {
 		t.Fatalf("With must return a new, grown bitfield: %08b / %08b", b, grown)
+	}
+	full := Full(10)
+	if full.Count() != 10 || full.Has(10) || len(full) != 2 {
+		t.Fatalf("Full(10) = %08b", full)
+	}
+	rest := full.Minus(Bitfield{0b1000_0000, 0b0100_0000})
+	if rest.Count() != 8 || rest.Has(0) || rest.Has(9) || full.Count() != 10 {
+		t.Fatalf("Minus = %08b, original %08b", rest, full)
 	}
 }
 
@@ -233,8 +263,8 @@ func TestDownloadBlockFromAnacrolix(t *testing.T) {
 			t.Fatalf("waiting for unchoke: %v", err)
 		}
 	}
-	if !c.Bitfield.Has(0) || !c.Bitfield.Has(1) {
-		t.Fatalf("seeder should have both pieces: %08b", c.Bitfield)
+	if !c.Has(0) || !c.Has(1) {
+		t.Fatalf("seeder should have both pieces (bitfield %08b, have all %v)", c.Bitfield, c.All)
 	}
 
 	const blockSize = 16 << 10
