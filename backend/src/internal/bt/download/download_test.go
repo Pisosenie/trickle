@@ -42,17 +42,20 @@ func randomBytes(n int) []byte {
 
 func newFixture(t *testing.T, multi bool) fixture {
 	t.Helper()
-	src := t.TempDir()
-	files := map[string][]byte{"image.iso": randomBytes(1<<20 + 4321)}
-	root := filepath.Join(src, "image.iso")
 	if multi {
-		files = map[string][]byte{
+		return buildFixture(t, "pack", pieceLength, map[string][]byte{
 			"pack/readme.txt":      randomBytes(1000),
 			"pack/disc/image.iso":  randomBytes(600 << 10),
 			"pack/disc/extras.bin": randomBytes(200<<10 + 7),
-		}
-		root = filepath.Join(src, "pack")
+		})
 	}
+	return buildFixture(t, "image.iso", pieceLength, map[string][]byte{"image.iso": randomBytes(1<<20 + 4321)})
+}
+
+func buildFixture(t *testing.T, top string, pieceLen int64, files map[string][]byte) fixture {
+	t.Helper()
+	src := t.TempDir()
+	root := filepath.Join(src, top)
 	for rel, data := range files {
 		path := filepath.Join(src, rel)
 		os.MkdirAll(filepath.Dir(path), 0o755)
@@ -61,7 +64,7 @@ func newFixture(t *testing.T, multi bool) fixture {
 		}
 	}
 
-	info := metainfo.Info{PieceLength: pieceLength}
+	info := metainfo.Info{PieceLength: pieceLen}
 	if err := info.BuildFromFilePath(root); err != nil {
 		t.Fatal(err)
 	}
@@ -368,4 +371,72 @@ func TestChokeMidPieceDoesNotStall(t *testing.T) {
 		t.Fatalf("download after a choke: %v", err)
 	}
 	fx.check(t, out)
+}
+
+func ourSeeder(t *testing.T, fx fixture, uploadLimit int64) netip.AddrPort {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		Seed(ctx, Config{Torrent: fx.tf, PeerID: [20]byte{'-', 'S', 'L'}, Dir: fx.src, Listener: ln, UploadLimit: uploadLimit})
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+	return netip.MustParseAddrPort(ln.Addr().String())
+}
+
+func TestEndgameDoesNotWaitForSlowPeer(t *testing.T) {
+	fx := buildFixture(t, "image.iso", 512<<10, map[string][]byte{"image.iso": randomBytes(2 << 20)})
+	slow := ourSeeder(t, fx, 64<<10)
+	more := make(chan []netip.AddrPort, 1)
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		more <- []netip.AddrPort{seed(t, fx)}
+	}()
+
+	out := t.TempDir()
+	elapsed, err := download(t, Config{Torrent: fx.tf, PeerID: ourID, Peers: []netip.AddrPort{slow}, MorePeers: more, Dir: out})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fx.check(t, out)
+	if elapsed > 3*time.Second {
+		t.Fatalf("the last piece waited for the slow peer: %v", elapsed)
+	}
+}
+
+func TestMorePeersRescueAStalledDownload(t *testing.T) {
+	fx := newFixture(t, false)
+	ln, _ := net.Listen("tcp", "127.0.0.1:0")
+	dead := netip.MustParseAddrPort(ln.Addr().String())
+	ln.Close()
+
+	more := make(chan []netip.AddrPort)
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		more <- []netip.AddrPort{dead, seed(t, fx)}
+		close(more)
+	}()
+	out := t.TempDir()
+	if _, err := download(t, Config{Torrent: fx.tf, PeerID: ourID, Peers: []netip.AddrPort{dead}, MorePeers: more, Dir: out}); err != nil {
+		t.Fatalf("new peers should have rescued the download: %v", err)
+	}
+	fx.check(t, out)
+}
+
+func TestClosedPeerSourceEndsTheWait(t *testing.T) {
+	fx := newFixture(t, false)
+	more := make(chan []netip.AddrPort)
+	close(more)
+	_, err := download(t, Config{Torrent: fx.tf, PeerID: ourID, MorePeers: more, Dir: t.TempDir()})
+	if err == nil || !strings.Contains(err.Error(), "all peers are gone") {
+		t.Fatalf("expected all-peers-gone once the source is closed, got %v", err)
+	}
 }

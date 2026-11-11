@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"trickle/internal/bt/bencode"
@@ -21,6 +22,7 @@ type Entry struct {
 
 type File struct {
 	Announce    string
+	Trackers    []string
 	InfoHash    [hashLen]byte
 	Name        string
 	Length      int64
@@ -43,10 +45,20 @@ func Parse(data []byte) (File, error) {
 		return File{}, invalid("%v", err)
 	}
 	announce, _ := top["announce"].(string)
-	return ParseInfo(rawInfo, announce)
+	trackers := []string{announce}
+	tiers, _ := top["announce-list"].([]any)
+	for _, tier := range tiers {
+		urls, _ := tier.([]any)
+		for _, u := range urls {
+			if s, ok := u.(string); ok {
+				trackers = append(trackers, s)
+			}
+		}
+	}
+	return ParseInfo(rawInfo, trackers...)
 }
 
-func ParseInfo(rawInfo []byte, announce string) (File, error) {
+func ParseInfo(rawInfo []byte, trackers ...string) (File, error) {
 	decoded, err := bencode.Decode(rawInfo)
 	if err != nil {
 		return File{}, invalid("%v", err)
@@ -80,8 +92,14 @@ func ParseInfo(rawInfo []byte, announce string) (File, error) {
 		return File{}, invalid("%d piece hashes for %d pieces", len(pieces)/hashLen, want)
 	}
 
+	unique := uniqueTrackers(trackers)
+	announce := ""
+	if len(unique) > 0 {
+		announce = unique[0]
+	}
 	return File{
 		Announce:    announce,
+		Trackers:    unique,
 		InfoHash:    sha1.Sum(rawInfo),
 		Name:        name,
 		Length:      length,
@@ -120,6 +138,16 @@ func entries(info map[string]any, name string) ([]Entry, error) {
 		files = append(files, Entry{Path: path, Length: length})
 	}
 	return files, nil
+}
+
+func uniqueTrackers(trackers []string) []string {
+	var unique []string
+	for _, tr := range trackers {
+		if tr != "" && !slices.Contains(unique, tr) {
+			unique = append(unique, tr)
+		}
+	}
+	return unique
 }
 
 func safeName(s string) bool {

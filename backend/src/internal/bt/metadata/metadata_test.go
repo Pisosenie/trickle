@@ -76,7 +76,7 @@ func TestFetchFromAnacrolix(t *testing.T) {
 	if !bytes.Equal(got, mi.InfoBytes) {
 		t.Fatal("metadata differs from the seeder's")
 	}
-	tf, err := torrentfile.ParseInfo(got, "")
+	tf, err := torrentfile.ParseInfo(got)
 	if err != nil || tf.InfoHash != mi.HashInfoBytes() || len(tf.Files) != 120 {
 		t.Fatalf("parsed %d files, hash %x, err %v", len(tf.Files), tf.InfoHash, err)
 	}

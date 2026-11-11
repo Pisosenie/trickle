@@ -9,3 +9,5 @@ __pycache__/
 .vscode/settings.json
 .idea/
 cli/
+backend/src/bt
+backend/src/torrentd

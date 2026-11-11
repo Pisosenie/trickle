@@ -16,12 +16,16 @@ const (
 	pieceTimeout = 30 * time.Second
 )
 
-var errHashMismatch = errors.New("piece failed SHA-1 check")
+var (
+	errHashMismatch = errors.New("piece failed SHA-1 check")
+	errAlreadyHave  = errors.New("piece finished by another peer")
+)
 
 type work struct {
-	index  int
-	hash   [20]byte
-	length int
+	index     int
+	hash      [20]byte
+	length    int
+	duplicate bool
 }
 
 type result struct {
@@ -41,6 +45,10 @@ func fetchPiece(ctx context.Context, l *link, w work) ([]byte, error) {
 	buf := make([]byte, w.length)
 
 	for left > 0 {
+		if l.s.has(w.index) {
+			cancelInFlight(c, w, inFlight)
+			return nil, errAlreadyHave
+		}
 		if !c.Choked {
 			for i := 0; i < blocks && backlog < maxBacklog; i++ {
 				if received[i] || inFlight[i] {
@@ -72,9 +80,11 @@ func fetchPiece(ctx context.Context, l *link, w work) ([]byte, error) {
 			if err != nil {
 				return nil, err
 			}
+			if block.Index != w.index {
+				continue
+			}
 			i := block.Begin / blockSize
-			if block.Index != w.index || block.Begin%blockSize != 0 || i >= blocks ||
-				len(block.Data) != min(blockSize, w.length-block.Begin) {
+			if block.Begin%blockSize != 0 || i >= blocks || len(block.Data) != min(blockSize, w.length-block.Begin) {
 				return nil, fmt.Errorf("%w: unexpected block %d@%d", peer.ErrProtocol, block.Index, block.Begin)
 			}
 			if received[i] {
@@ -97,4 +107,13 @@ func fetchPiece(ctx context.Context, l *link, w work) ([]byte, error) {
 		return nil, errHashMismatch
 	}
 	return buf, nil
+}
+
+func cancelInFlight(c *peer.Conn, w work, inFlight []bool) {
+	for i, pending := range inFlight {
+		if pending {
+			begin := i * blockSize
+			c.Send(peer.NewCancel(w.index, begin, min(blockSize, w.length-begin)))
+		}
+	}
 }

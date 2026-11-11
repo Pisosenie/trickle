@@ -130,3 +130,7 @@ func NewPiece(index, begin int, data []byte) *Message {
 	binary.BigEndian.PutUint32(payload[4:], uint32(begin))
 	return &Message{ID: Piece, Payload: append(payload, data...)}
 }
+
+func NewCancel(index, begin, length int) *Message {
+	return &Message{ID: Cancel, Payload: NewRequest(index, begin, length).Payload}
+}

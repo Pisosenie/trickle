@@ -22,12 +22,15 @@ const (
 	idleTimeout   = 2 * time.Minute
 	idleAfterMiss = time.Second
 	maxRequest    = 128 << 10
+	endgamePoll   = 500 * time.Millisecond
+	maxFetchers   = 2
 )
 
 type Config struct {
 	Torrent       torrentfile.File
 	PeerID        [20]byte
 	Peers         []netip.AddrPort
+	MorePeers     <-chan []netip.AddrPort
 	Dir           string
 	MaxPeers      int
 	Listener      net.Listener
@@ -43,9 +46,11 @@ type session struct {
 	down  *rate.Limiter
 	up    *rate.Limiter
 
-	mu   sync.Mutex
-	have peer.Bitfield
-	done int
+	mu       sync.Mutex
+	have     peer.Bitfield
+	done     int
+	fetching map[int]work
+	fetchers map[int]int
 }
 
 func open(cfg Config) (*session, error) {
@@ -59,12 +64,14 @@ func open(cfg Config) (*session, error) {
 		return nil, err
 	}
 	s := &session{
-		cfg:   cfg,
-		tf:    cfg.Torrent,
-		store: store,
-		down:  limiter(cfg.DownloadLimit),
-		up:    limiter(cfg.UploadLimit),
-		have:  make(peer.Bitfield, (len(verified)+7)/8),
+		cfg:      cfg,
+		tf:       cfg.Torrent,
+		store:    store,
+		down:     limiter(cfg.DownloadLimit),
+		up:       limiter(cfg.UploadLimit),
+		have:     make(peer.Bitfield, (len(verified)+7)/8),
+		fetching: map[int]work{},
+		fetchers: map[int]int{},
 	}
 	for i, ok := range verified {
 		if ok {
@@ -94,14 +101,69 @@ func (s *session) has(index int) bool {
 	return s.have.Has(index)
 }
 
-func (s *session) markHave(index int) int {
+func (s *session) markHave(index int) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.have.Has(index) {
-		s.have = s.have.With(index)
-		s.done++
+	if s.have.Has(index) {
+		return false
 	}
-	return s.done
+	s.have = s.have.With(index)
+	s.done++
+	return true
+}
+
+func (s *session) startFetch(w work) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	original := w
+	original.duplicate = false
+	s.fetching[w.index] = original
+	s.fetchers[w.index]++
+}
+
+func (s *session) endFetch(index int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.fetchers[index]--; s.fetchers[index] <= 0 {
+		delete(s.fetchers, index)
+		delete(s.fetching, index)
+	}
+}
+
+// endgame: when the queue is empty, help with a piece another peer is already fetching
+func (s *session) endgamePick(has peer.Bitfield) (work, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for index, w := range s.fetching {
+		if has.Has(index) && !s.have.Has(index) && s.fetchers[index] < maxFetchers {
+			w.duplicate = true
+			return w, true
+		}
+	}
+	return work{}, false
+}
+
+func (s *session) next(ctx context.Context, queue chan work, has peer.Bitfield) (work, bool) {
+	timer := time.NewTimer(endgamePoll)
+	defer timer.Stop()
+	for {
+		select {
+		case w := <-queue:
+			return w, true
+		default:
+		}
+		if w, ok := s.endgamePick(has); ok {
+			return w, true
+		}
+		timer.Reset(endgamePoll)
+		select {
+		case w := <-queue:
+			return w, true
+		case <-timer.C:
+		case <-ctx.Done():
+			return work{}, false
+		}
+	}
 }
 
 func (s *session) progress() {
@@ -127,8 +189,9 @@ func Download(ctx context.Context, cfg Config) error {
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
-	var serving sync.WaitGroup
+	var serving, workers sync.WaitGroup
 	defer serving.Wait()
+	defer workers.Wait()
 	defer cancel()
 	s.listen(ctx, &serving)
 
@@ -137,19 +200,48 @@ func Download(ctx context.Context, cfg Config) error {
 		queue <- w
 	}
 	results := make(chan result)
-	allGone := s.startWorkers(ctx, queue, results)
+	exits := make(chan struct{})
+	peers := newPool(cfg.MaxPeers)
+	launch := func(addrs []netip.AddrPort) {
+		for _, addr := range peers.admit(time.Now(), addrs) {
+			workers.Add(1)
+			go func() {
+				defer workers.Done()
+				s.worker(ctx, addr, queue, results)
+				select {
+				case exits <- struct{}{}:
+				case <-ctx.Done():
+				}
+			}()
+		}
+	}
+	launch(cfg.Peers)
 
+	more := cfg.MorePeers
 	for left := len(missing); left > 0; {
+		if peers.active == 0 && more == nil {
+			return fmt.Errorf("all peers are gone with %d of %d pieces missing", left, len(s.tf.Pieces))
+		}
 		select {
 		case r := <-results:
+			if s.has(r.index) {
+				continue
+			}
 			if err := s.store.WriteAt(r.data, int64(r.index)*s.tf.PieceLength); err != nil {
 				return fmt.Errorf("write piece %d: %w", r.index, err)
 			}
 			s.markHave(r.index)
 			s.progress()
 			left--
-		case <-allGone:
-			return fmt.Errorf("all peers are gone with %d of %d pieces missing", left, len(s.tf.Pieces))
+		case <-exits:
+			peers.exited()
+			launch(nil)
+		case addrs, ok := <-more:
+			if !ok {
+				more = nil
+				continue
+			}
+			launch(addrs)
 		case <-ctx.Done():
 			return ctx.Err()
 		}
@@ -184,27 +276,6 @@ func (s *session) missing() []work {
 		}
 	}
 	return todo
-}
-
-func (s *session) startWorkers(ctx context.Context, queue chan work, results chan<- result) <-chan struct{} {
-	peers := s.cfg.Peers
-	if s.cfg.MaxPeers > 0 {
-		peers = peers[:min(len(peers), s.cfg.MaxPeers)]
-	}
-	var wg sync.WaitGroup
-	for _, addr := range peers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			s.worker(ctx, addr, queue, results)
-		}()
-	}
-	allGone := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(allGone)
-	}()
-	return allGone
 }
 
 func (s *session) listen(ctx context.Context, serving *sync.WaitGroup) {

@@ -4,29 +4,17 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
-	"net"
-	"net/http"
-	"net/netip"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
-	"sync"
 	"time"
 
-	"trickle/internal/bt/dht"
+	"trickle/internal/bt/bencode"
 	"trickle/internal/bt/magnet"
 	"trickle/internal/bt/metadata"
 	"trickle/internal/bt/torrentfile"
 	"trickle/internal/bt/tracker"
 )
-
-var bootstrapNodes = []string{
-	"router.bittorrent.com:6881",
-	"dht.transmissionbt.com:6881",
-	"router.utorrent.com:6881",
-	"dht.libtorrent.org:25401",
-}
 
 func parseTarget(arg string) (magnet.Link, error) {
 	if strings.HasPrefix(arg, "magnet:") {
@@ -46,7 +34,7 @@ func dhtPeers(arg string) error {
 	if err != nil {
 		return err
 	}
-	peers, err := lookupDHT(link.InfoHash, 100)
+	peers, err := lookupDHT(context.Background(), link.InfoHash, dhtWant)
 	if err != nil {
 		return err
 	}
@@ -55,44 +43,6 @@ func dhtPeers(arg string) error {
 		fmt.Println(p)
 	}
 	return nil
-}
-
-func lookupDHT(infoHash [20]byte, want int) ([]netip.AddrPort, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	conn, err := net.ListenPacket("udp4", ":0")
-	if err != nil {
-		return nil, err
-	}
-	client, err := dht.NewClient(conn)
-	if err != nil {
-		conn.Close()
-		return nil, err
-	}
-	defer client.Close()
-	return client.FindPeers(ctx, infoHash, resolve(ctx, bootstrapNodes), want)
-}
-
-func resolve(ctx context.Context, hosts []string) []netip.AddrPort {
-	var addrs []netip.AddrPort
-	for _, hostport := range hosts {
-		host, portText, err := net.SplitHostPort(hostport)
-		if err != nil {
-			continue
-		}
-		port, err := strconv.ParseUint(portText, 10, 16)
-		if err != nil {
-			continue
-		}
-		ips, err := net.DefaultResolver.LookupNetIP(ctx, "ip4", host)
-		if err != nil {
-			continue
-		}
-		for _, ip := range ips {
-			addrs = append(addrs, netip.AddrPortFrom(ip, uint16(port)))
-		}
-	}
-	return addrs
 }
 
 func fromMagnet(uri string) error {
@@ -104,7 +54,7 @@ func fromMagnet(uri string) error {
 	if err != nil {
 		return err
 	}
-	peers := gatherPeers(link, peerID)
+	peers := gatherPeers(context.Background(), link.InfoHash, supportedTrackers(link.Trackers), peerID, 1)
 	if len(peers) == 0 {
 		return fmt.Errorf("found no peers for %x", link.InfoHash)
 	}
@@ -116,77 +66,42 @@ func fromMagnet(uri string) error {
 	if err != nil {
 		return err
 	}
-	announce := firstSupportedTracker(link.Trackers)
-	tf, err := torrentfile.ParseInfo(info, announce)
+	tf, err := torrentfile.ParseInfo(info, supportedTrackers(link.Trackers)...)
 	if err != nil {
 		return err
 	}
 	saved := filepath.Base(tf.Name) + ".torrent"
-	if err := os.WriteFile(saved, torrentBytes(info, announce), 0o644); err != nil {
+	if err := os.WriteFile(saved, torrentBytes(info, tf.Trackers), 0o644); err != nil {
 		return err
 	}
 	fmt.Printf("got the metadata for %s, saved %s\n", tf.Name, saved)
 	return downloadFrom(tf, peerID, peers)
 }
 
-func gatherPeers(link magnet.Link, peerID [20]byte) []netip.AddrPort {
-	var (
-		mu    sync.Mutex
-		wg    sync.WaitGroup
-		seen  = map[netip.AddrPort]bool{}
-		peers []netip.AddrPort
-	)
-	add := func(found []netip.AddrPort) {
-		mu.Lock()
-		defer mu.Unlock()
-		for _, p := range found {
-			if !seen[p] {
-				seen[p] = true
-				peers = append(peers, p)
-			}
-		}
-	}
-
-	for _, tr := range link.Trackers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-			defer cancel()
-			res, err := tracker.Announce(ctx, http.DefaultClient, tr, tracker.Request{
-				InfoHash: link.InfoHash, PeerID: peerID, Port: listenPort, Left: 1, Event: tracker.EventStarted,
-			})
-			if err == nil {
-				add(res.Peers)
-			}
-		}()
-	}
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		if found, err := lookupDHT(link.InfoHash, 100); err == nil {
-			add(found)
-		}
-	}()
-	wg.Wait()
-	return peers
-}
-
-func firstSupportedTracker(trackers []string) string {
+func supportedTrackers(trackers []string) []string {
+	var ok []string
 	for _, tr := range trackers {
 		if strings.HasPrefix(tr, "http://") || strings.HasPrefix(tr, "https://") || strings.HasPrefix(tr, "udp://") {
-			return tr
+			ok = append(ok, tr)
 		}
 	}
-	return ""
+	return ok
 }
 
 // built by hand so the info dictionary keeps its exact bytes and therefore its hash
-func torrentBytes(info []byte, announce string) []byte {
-	head := "d"
-	if announce != "" {
-		head += fmt.Sprintf("8:announce%d:%s", len(announce), announce)
+func torrentBytes(info []byte, trackers []string) []byte {
+	out := []byte("d")
+	if len(trackers) > 0 {
+		out = fmt.Appendf(out, "8:announce%d:%s", len(trackers[0]), trackers[0])
 	}
-	out := append([]byte(head+"4:info"), info...)
+	if len(trackers) > 1 {
+		tiers := make([]any, 0, len(trackers))
+		for _, tr := range trackers {
+			tiers = append(tiers, []any{tr})
+		}
+		list, _ := bencode.Encode(tiers)
+		out = append(append(out, "13:announce-list"...), list...)
+	}
+	out = append(append(out, "4:info"...), info...)
 	return append(out, 'e')
 }

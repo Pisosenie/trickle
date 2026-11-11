@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/sha1"
+	"slices"
 	"testing"
 
 	"trickle/internal/bt/torrentfile"
@@ -9,13 +10,17 @@ import (
 
 func TestSavedTorrentKeepsInfoHash(t *testing.T) {
 	info := []byte("d6:lengthi1e4:name5:x.iso12:piece lengthi1e6:pieces20:aaaaaaaaaaaaaaaaaaaae")
-	for _, announce := range []string{"http://tracker.example/announce", ""} {
-		tf, err := torrentfile.Parse(torrentBytes(info, announce))
+	for _, trackers := range [][]string{
+		{"http://tracker.example/announce", "udp://backup.example:1337/announce"},
+		{"udp://only.example:6969"},
+		nil,
+	} {
+		tf, err := torrentfile.Parse(torrentBytes(info, trackers))
 		if err != nil {
-			t.Fatalf("announce %q: %v", announce, err)
+			t.Fatalf("trackers %v: %v", trackers, err)
 		}
-		if tf.InfoHash != sha1.Sum(info) || tf.Announce != announce || tf.Name != "x.iso" {
-			t.Fatalf("announce %q: got %+v", announce, tf)
+		if tf.InfoHash != sha1.Sum(info) || !slices.Equal(tf.Trackers, trackers) || tf.Name != "x.iso" {
+			t.Fatalf("trackers %v: got %+v", trackers, tf)
 		}
 	}
 }
@@ -35,11 +40,9 @@ func TestParseTarget(t *testing.T) {
 	}
 }
 
-func TestFirstSupportedTracker(t *testing.T) {
-	if got := firstSupportedTracker([]string{"wss://a/announce", "udp://b:1337/announce", "http://c"}); got != "udp://b:1337/announce" {
-		t.Fatalf("got %q", got)
-	}
-	if firstSupportedTracker([]string{"wss://a/announce"}) != "" {
-		t.Fatal("WebSocket trackers are not supported")
+func TestSupportedTrackers(t *testing.T) {
+	got := supportedTrackers([]string{"wss://a/announce", "udp://b:1337/announce", "http://c"})
+	if !slices.Equal(got, []string{"udp://b:1337/announce", "http://c"}) {
+		t.Fatalf("got %v", got)
 	}
 }

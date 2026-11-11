@@ -2,6 +2,7 @@ package download
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -97,10 +98,8 @@ func (s *session) worker(ctx context.Context, addr netip.AddrPort, queue chan wo
 
 	misses := 0
 	for {
-		var w work
-		select {
-		case w = <-queue:
-		case <-ctx.Done():
+		w, ok := s.next(ctx, queue, c.Bitfield)
+		if !ok {
 			return
 		}
 		if !c.Bitfield.Has(w.index) {
@@ -115,9 +114,16 @@ func (s *session) worker(ctx context.Context, addr netip.AddrPort, queue chan wo
 		}
 		misses = 0
 
+		s.startFetch(w)
 		data, err := fetchPiece(ctx, l, w)
+		s.endFetch(w.index)
+		if errors.Is(err, errAlreadyHave) {
+			continue
+		}
 		if err != nil {
-			queue <- w
+			if !w.duplicate {
+				queue <- w
+			}
 			return
 		}
 		c.Send(peer.NewHave(w.index))

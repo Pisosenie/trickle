@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/anacrolix/torrent/bencode"
@@ -128,5 +129,24 @@ func TestParseMultiFile(t *testing.T) {
 		if filepath.Join(got.Files[i].Path...) != filepath.Join(want...) || got.Files[i].Length != f.Length {
 			t.Errorf("file %d = %+v, want %v (%d bytes)", i, got.Files[i], want, f.Length)
 		}
+	}
+}
+
+func TestAnnounceList(t *testing.T) {
+	info := "d6:lengthi1e4:name1:x12:piece lengthi1e6:pieces20:aaaaaaaaaaaaaaaaaaaae"
+	data := "d8:announce5:http1" +
+		"13:announce-listll5:http1e" + "l5:udp:a5:udp:be" + "l0:ee" +
+		"4:info" + info + "e"
+	got, err := Parse([]byte(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Announce != "http1" || !slices.Equal(got.Trackers, []string{"http1", "udp:a", "udp:b"}) {
+		t.Fatalf("announce %q, trackers %v", got.Announce, got.Trackers)
+	}
+
+	bare, err := ParseInfo([]byte(info))
+	if err != nil || bare.Announce != "" || len(bare.Trackers) != 0 {
+		t.Fatalf("no trackers: %+v, %v", bare, err)
 	}
 }
