@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/time/rate"
@@ -36,7 +37,14 @@ type Config struct {
 	Listener      net.Listener
 	DownloadLimit int64
 	UploadLimit   int64
-	Progress      func(done, total int)
+	Progress      func(Progress)
+}
+
+type Progress struct {
+	Done       int
+	Total      int
+	Downloaded int64
+	Uploaded   int64
 }
 
 type session struct {
@@ -51,6 +59,10 @@ type session struct {
 	done     int
 	fetching map[int]work
 	fetchers map[int]int
+	links    map[*link]struct{}
+
+	downloaded atomic.Int64
+	uploaded   atomic.Int64
 }
 
 func open(cfg Config) (*session, error) {
@@ -72,6 +84,7 @@ func open(cfg Config) (*session, error) {
 		have:     make(peer.Bitfield, (len(verified)+7)/8),
 		fetching: map[int]work{},
 		fetchers: map[int]int{},
+		links:    map[*link]struct{}{},
 	}
 	for i, ok := range verified {
 		if ok {
@@ -166,13 +179,44 @@ func (s *session) next(ctx context.Context, queue chan work, has peer.Bitfield) 
 	}
 }
 
-func (s *session) progress() {
-	if s.cfg.Progress != nil {
-		s.mu.Lock()
-		done := s.done
-		s.mu.Unlock()
-		s.cfg.Progress(done, len(s.tf.Pieces))
+func (s *session) register(l *link) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.links[l] = struct{}{}
+}
+
+func (s *session) dropLink(l *link) {
+	s.mu.Lock()
+	delete(s.links, l)
+	s.mu.Unlock()
+	close(l.outbox)
+}
+
+// a peer that is too slow to take a have just misses it; it is advisory
+func (s *session) announceHave(index int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for l := range s.links {
+		select {
+		case l.outbox <- peer.NewHave(index):
+		default:
+		}
 	}
+}
+
+func (s *session) progress() {
+	if s.cfg.Progress == nil {
+		return
+	}
+	s.mu.Lock()
+	done := s.done
+	s.mu.Unlock()
+	s.cfg.Progress(Progress{
+		Done:       done,
+		Total:      len(s.tf.Pieces),
+		Downloaded: s.downloaded.Load(),
+		Uploaded:   s.uploaded.Load(),
+	})
 }
 
 func Download(ctx context.Context, cfg Config) error {
@@ -231,6 +275,8 @@ func Download(ctx context.Context, cfg Config) error {
 				return fmt.Errorf("write piece %d: %w", r.index, err)
 			}
 			s.markHave(r.index)
+			s.downloaded.Add(int64(len(r.data)))
+			s.announceHave(r.index)
 			s.progress()
 			left--
 		case <-exits:

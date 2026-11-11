@@ -88,7 +88,7 @@ func printPeers(tf torrentfile.File) error {
 	if err != nil {
 		return err
 	}
-	peers, answered := announceAll(context.Background(), tf.InfoHash, tf.Trackers, peerID, tf.Length)
+	peers, answered := announceAll(context.Background(), tf.Trackers, request(tf.InfoHash, peerID, tf.Length, tracker.EventStarted))
 	fmt.Printf("%d peers from %d of %d trackers\n", len(peers), answered, len(tf.Trackers))
 	for _, p := range peers {
 		fmt.Println(p)
@@ -106,7 +106,7 @@ func printHandshakes(tf torrentfile.File) error {
 	if err != nil {
 		return err
 	}
-	found, _ := announceAll(context.Background(), tf.InfoHash, tf.Trackers, peerID, tf.Length)
+	found, _ := announceAll(context.Background(), tf.Trackers, request(tf.InfoHash, peerID, tf.Length, tracker.EventStarted))
 	peers := found[:min(len(found), maxProbes)]
 
 	results := make(chan probe, len(peers))
@@ -164,7 +164,7 @@ func downloadFile(tf torrentfile.File) error {
 	if err != nil {
 		return err
 	}
-	peers := gatherPeers(context.Background(), tf.InfoHash, tf.Trackers, peerID, tf.Length)
+	peers := gatherPeers(context.Background(), tf.Trackers, request(tf.InfoHash, peerID, tf.Length, tracker.EventStarted))
 	fmt.Printf("%s: %d peers from %d trackers and the DHT\n", tf.Name, len(peers), len(tf.Trackers))
 	return downloadFrom(tf, peerID, peers)
 }
@@ -177,20 +177,36 @@ func downloadFrom(tf torrentfile.File, peerID [20]byte, peers []netip.AddrPort) 
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
+	if ln != nil {
+		go func() { announceDHT(ctx, tf.InfoHash) }()
+	}
+
+	var stats progressStats
+	current := func() tracker.Request { return stats.request(tf, peerID) }
 	started := time.Now()
 	err = download.Download(ctx, download.Config{
 		Torrent:   tf,
 		PeerID:    peerID,
 		Peers:     peers,
-		MorePeers: refill(ctx, tf, peerID),
+		MorePeers: refill(ctx, tf.Trackers, current),
 		Dir:       ".",
 		MaxPeers:  maxProbes,
 		Listener:  ln,
-		Progress: func(done, total int) {
-			fmt.Printf("\r%5.1f%%  %d/%d pieces", float64(done)*100/float64(total), done, total)
+		Progress: func(p download.Progress) {
+			stats.store(p)
+			fmt.Printf("\r%5.1f%%  %d/%d pieces", float64(p.Done)*100/float64(p.Total), p.Done, p.Total)
 		},
 	})
 	fmt.Println()
+
+	goodbye := current()
+	if err == nil {
+		goodbye.Event = tracker.EventCompleted
+		goodbye.Left = 0
+		farewell(tf.Trackers, goodbye)
+	}
+	goodbye.Event = tracker.EventStopped
+	farewell(tf.Trackers, goodbye)
 	if err != nil {
 		return err
 	}
@@ -207,11 +223,20 @@ func seedFile(tf torrentfile.File) error {
 	if err != nil {
 		return err
 	}
-	if _, answered := announceAll(context.Background(), tf.InfoHash, tf.Trackers, peerID, 0); answered == 0 {
+	if _, answered := announceAll(context.Background(), tf.Trackers, request(tf.InfoHash, peerID, 0, tracker.EventStarted)); answered == 0 {
 		fmt.Println("no tracker took the announce; peers can still find us through others")
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 	fmt.Printf("checking %s, then sharing it on %s until Ctrl+C\n", tf.Name, listenAddr)
-	return download.Seed(ctx, download.Config{Torrent: tf, PeerID: peerID, Dir: ".", Listener: ln})
+	go keepAnnouncing(ctx, tf.InfoHash, func(accepted int, err error) {
+		if err != nil {
+			fmt.Printf("DHT announce failed: %v\n", err)
+			return
+		}
+		fmt.Printf("announced to %d DHT nodes\n", accepted)
+	})
+	err = download.Seed(ctx, download.Config{Torrent: tf, PeerID: peerID, Dir: ".", Listener: ln})
+	farewell(tf.Trackers, request(tf.InfoHash, peerID, 0, tracker.EventStopped))
+	return err
 }

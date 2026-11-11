@@ -175,17 +175,24 @@ func TestDownloadSurvivesALiar(t *testing.T) {
 	var lies atomic.Int64
 	out := t.TempDir()
 	var last atomic.Int64
+	var downloaded atomic.Int64
 	_, err := download(t, Config{
-		Torrent:  fx.tf,
-		PeerID:   ourID,
-		Peers:    []netip.AddrPort{liar(t, fx, &lies), seed(t, fx), seed(t, fx)},
-		Dir:      out,
-		Progress: func(done, total int) { last.Store(int64(done*1000 + total)) },
+		Torrent: fx.tf,
+		PeerID:  ourID,
+		Peers:   []netip.AddrPort{liar(t, fx, &lies), seed(t, fx), seed(t, fx)},
+		Dir:     out,
+		Progress: func(p Progress) {
+			last.Store(int64(p.Done*1000 + p.Total))
+			downloaded.Store(p.Downloaded)
+		},
 	})
 	if err != nil {
 		t.Fatalf("download: %v", err)
 	}
 	fx.check(t, out)
+	if downloaded.Load() != fx.tf.Length {
+		t.Fatalf("progress counted %d downloaded bytes, want %d", downloaded.Load(), fx.tf.Length)
+	}
 	if total := int64(len(fx.tf.Pieces)); last.Load() != total*1000+total {
 		t.Fatalf("progress ended at %d", last.Load())
 	}
@@ -219,8 +226,8 @@ func TestResumeKeepsVerifiedPieces(t *testing.T) {
 		PeerID:  ourID,
 		Peers:   []netip.AddrPort{seed(t, fx)},
 		Dir:     out,
-		Progress: func(done, total int) {
-			first.CompareAndSwap(-1, int64(done))
+		Progress: func(p Progress) {
+			first.CompareAndSwap(-1, int64(p.Done))
 		},
 	})
 	if err != nil {
@@ -438,5 +445,67 @@ func TestClosedPeerSourceEndsTheWait(t *testing.T) {
 	_, err := download(t, Config{Torrent: fx.tf, PeerID: ourID, MorePeers: more, Dir: t.TempDir()})
 	if err == nil || !strings.Contains(err.Error(), "all peers are gone") {
 		t.Fatalf("expected all-peers-gone once the source is closed, got %v", err)
+	}
+}
+
+// watcher has nothing to give and never unchokes; it only records the haves we send
+func watcher(t *testing.T, fx fixture, haves chan<- int) netip.AddrPort {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		nc, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer nc.Close()
+		if _, err := peer.ReadHandshake(nc); err != nil {
+			return
+		}
+		nc.Write(peer.Handshake{InfoHash: fx.tf.InfoHash, PeerID: [20]byte{'-', 'W', 'A'}}.Bytes())
+		for {
+			m, err := peer.ReadMessage(nc)
+			if err != nil {
+				return
+			}
+			if m != nil && m.ID == peer.Have {
+				index, _ := peer.ParseHave(m)
+				haves <- index
+			}
+		}
+	}()
+	return netip.MustParseAddrPort(ln.Addr().String())
+}
+
+func TestFinishedPiecesAreAnnouncedToEveryPeer(t *testing.T) {
+	fx := newFixture(t, false)
+	haves := make(chan int, 1024)
+	more := make(chan []netip.AddrPort, 1)
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		more <- []netip.AddrPort{seed(t, fx)}
+	}()
+	if _, err := download(t, Config{
+		Torrent:   fx.tf,
+		PeerID:    ourID,
+		Peers:     []netip.AddrPort{watcher(t, fx, haves)},
+		MorePeers: more,
+		Dir:       t.TempDir(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	got := map[int]bool{}
+	deadline := time.After(2 * time.Second)
+	for len(got) < len(fx.tf.Pieces) {
+		select {
+		case index := <-haves:
+			got[index] = true
+		case <-deadline:
+			t.Fatalf("the watcher heard about %d of %d pieces", len(got), len(fx.tf.Pieces))
+		}
 	}
 }

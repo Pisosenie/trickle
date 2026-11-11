@@ -197,8 +197,85 @@ func TestTalksToAnacrolixNode(t *testing.T) {
 	if err != nil || id != remote.ID() {
 		t.Fatalf("ping anacrolix: id %x, %v", id, err)
 	}
-	answered, _, _, err := c.getPeers(ctx, addr, idWith(0x42))
-	if err != nil || answered.id != remote.ID() {
+	answered, err := c.getPeers(ctx, addr, idWith(0x42))
+	if err != nil || answered.from.id != remote.ID() {
 		t.Fatalf("get_peers to anacrolix: %+v, %v", answered, err)
+	}
+}
+
+type announced struct {
+	node  string
+	token string
+	port  int64
+	hash  string
+}
+
+func TestAnnounceUsesEachNodesToken(t *testing.T) {
+	target := idWith(0x80)
+	got := make(chan announced, 16)
+	tokenNode := func(name string, id [20]byte, nodes func() string, accept bool) node {
+		n := node{id: id}
+		n.addr = fakeNode(t, id, func(q map[string]any) map[string]any {
+			args, _ := q["a"].(map[string]any)
+			switch q["q"] {
+			case "get_peers":
+				reply := map[string]any{"token": "tok-" + name}
+				if nodes != nil {
+					reply["nodes"] = nodes()
+				}
+				return reply
+			case "announce_peer":
+				token, _ := args["token"].(string)
+				port, _ := args["port"].(int64)
+				hash, _ := args["info_hash"].(string)
+				got <- announced{node: name, token: token, port: port, hash: hash}
+				if !accept {
+					return map[string]any{"error": true}
+				}
+				return map[string]any{}
+			}
+			return nil
+		})
+		return n
+	}
+
+	near := tokenNode("near", idWith(0x81), nil, true)
+	grumpy := tokenNode("grumpy", idWith(0x82), nil, false)
+	far := tokenNode("far", idWith(0xc0), func() string { return compactNode(near) + compactNode(grumpy) }, true)
+
+	c := newClient(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	accepted, err := c.Announce(ctx, target, []netip.AddrPort{far.addr}, 6881)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if accepted != 2 {
+		t.Fatalf("accepted by %d nodes, want 2 (grumpy refuses)", accepted)
+	}
+
+	seenNodes := map[string]bool{}
+	for range 3 {
+		a := <-got
+		if a.token != "tok-"+a.node || a.port != 6881 || a.hash != string(target[:]) {
+			t.Fatalf("bad announce to %s: %+v", a.node, a)
+		}
+		seenNodes[a.node] = true
+	}
+	if !seenNodes["near"] || !seenNodes["grumpy"] || !seenNodes["far"] {
+		t.Fatalf("announced to %v", seenNodes)
+	}
+}
+
+func TestAnnounceFailsWhenNobodyAccepts(t *testing.T) {
+	refuser := fakeNode(t, idWith(3), func(q map[string]any) map[string]any {
+		if q["q"] == "get_peers" {
+			return map[string]any{"token": "x"}
+		}
+		return map[string]any{"error": true}
+	})
+	c := newClient(t)
+	if _, err := c.Announce(context.Background(), idWith(4), []netip.AddrPort{refuser}, 6881); err == nil {
+		t.Fatal("expected an error when every node refuses")
 	}
 }

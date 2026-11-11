@@ -5,6 +5,7 @@ import (
 	"slices"
 	"testing"
 
+	"trickle/internal/bt/download"
 	"trickle/internal/bt/torrentfile"
 )
 
@@ -44,5 +45,19 @@ func TestSupportedTrackers(t *testing.T) {
 	got := supportedTrackers([]string{"wss://a/announce", "udp://b:1337/announce", "http://c"})
 	if !slices.Equal(got, []string{"udp://b:1337/announce", "http://c"}) {
 		t.Fatalf("got %v", got)
+	}
+}
+
+func TestProgressStatsRequest(t *testing.T) {
+	tf := torrentfile.File{InfoHash: [20]byte{1}, Length: 1000, PieceLength: 100}
+	var stats progressStats
+	stats.store(download.Progress{Done: 3, Total: 10, Downloaded: 300, Uploaded: 50})
+	req := stats.request(tf, [20]byte{2})
+	if req.Left != 700 || req.Downloaded != 300 || req.Uploaded != 50 || req.Port != listenPort || req.InfoHash != tf.InfoHash {
+		t.Fatalf("got %+v", req)
+	}
+	stats.store(download.Progress{Done: 10, Total: 10})
+	if left := stats.request(tf, [20]byte{2}).Left; left != 0 {
+		t.Fatalf("finished download should report left=0, got %d", left)
 	}
 }

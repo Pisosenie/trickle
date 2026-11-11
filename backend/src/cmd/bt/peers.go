@@ -7,9 +7,11 @@ import (
 	"net/netip"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"trickle/internal/bt/dht"
+	"trickle/internal/bt/download"
 	"trickle/internal/bt/torrentfile"
 	"trickle/internal/bt/tracker"
 )
@@ -19,6 +21,8 @@ const (
 	dhtTimeout     = 30 * time.Second
 	dhtWant        = 100
 	refillEvery    = 2 * time.Minute
+
+	dhtAnnounceEvery = 15 * time.Minute
 )
 
 var bootstrapNodes = []string{
@@ -48,7 +52,30 @@ func (s *peerSet) add(found []netip.AddrPort) {
 	}
 }
 
-func announceAll(ctx context.Context, infoHash [20]byte, trackers []string, peerID [20]byte, left int64) ([]netip.AddrPort, int) {
+func request(infoHash, peerID [20]byte, left int64, event tracker.Event) tracker.Request {
+	return tracker.Request{InfoHash: infoHash, PeerID: peerID, Port: listenPort, Left: left, Event: event}
+}
+
+type progressStats struct {
+	done       atomic.Int64
+	downloaded atomic.Int64
+	uploaded   atomic.Int64
+}
+
+func (s *progressStats) store(p download.Progress) {
+	s.done.Store(int64(p.Done))
+	s.downloaded.Store(p.Downloaded)
+	s.uploaded.Store(p.Uploaded)
+}
+
+func (s *progressStats) request(tf torrentfile.File, peerID [20]byte) tracker.Request {
+	req := request(tf.InfoHash, peerID, max(tf.Length-s.done.Load()*tf.PieceLength, 0), tracker.EventNone)
+	req.Downloaded = s.downloaded.Load()
+	req.Uploaded = s.uploaded.Load()
+	return req
+}
+
+func announceAll(ctx context.Context, trackers []string, req tracker.Request) ([]netip.AddrPort, int) {
 	var (
 		set      peerSet
 		wg       sync.WaitGroup
@@ -61,9 +88,7 @@ func announceAll(ctx context.Context, infoHash [20]byte, trackers []string, peer
 			defer wg.Done()
 			ctx, cancel := context.WithTimeout(ctx, trackerTimeout)
 			defer cancel()
-			res, err := tracker.Announce(ctx, http.DefaultClient, tr, tracker.Request{
-				InfoHash: infoHash, PeerID: peerID, Port: listenPort, Left: left, Event: tracker.EventStarted,
-			})
+			res, err := tracker.Announce(ctx, http.DefaultClient, tr, req)
 			if err != nil {
 				return
 			}
@@ -77,18 +102,25 @@ func announceAll(ctx context.Context, infoHash [20]byte, trackers []string, peer
 	return set.peers, answered
 }
 
-func gatherPeers(ctx context.Context, infoHash [20]byte, trackers []string, peerID [20]byte, left int64) []netip.AddrPort {
+// a fresh context: by the time we say goodbye the download context is usually cancelled
+func farewell(trackers []string, req tracker.Request) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	announceAll(ctx, trackers, req)
+}
+
+func gatherPeers(ctx context.Context, trackers []string, req tracker.Request) []netip.AddrPort {
 	var set peerSet
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		found, _ := announceAll(ctx, infoHash, trackers, peerID, left)
+		found, _ := announceAll(ctx, trackers, req)
 		set.add(found)
 	}()
 	go func() {
 		defer wg.Done()
-		if found, err := lookupDHT(ctx, infoHash, dhtWant); err == nil {
+		if found, err := lookupDHT(ctx, req.InfoHash, dhtWant); err == nil {
 			set.add(found)
 		}
 	}()
@@ -96,7 +128,7 @@ func gatherPeers(ctx context.Context, infoHash [20]byte, trackers []string, peer
 	return set.peers
 }
 
-func refill(ctx context.Context, tf torrentfile.File, peerID [20]byte) <-chan []netip.AddrPort {
+func refill(ctx context.Context, trackers []string, current func() tracker.Request) <-chan []netip.AddrPort {
 	more := make(chan []netip.AddrPort)
 	go func() {
 		defer close(more)
@@ -108,7 +140,7 @@ func refill(ctx context.Context, tf torrentfile.File, peerID [20]byte) <-chan []
 			case <-ctx.Done():
 				return
 			}
-			found := gatherPeers(ctx, tf.InfoHash, tf.Trackers, peerID, tf.Length)
+			found := gatherPeers(ctx, trackers, current())
 			select {
 			case more <- found:
 			case <-ctx.Done():
@@ -119,20 +151,47 @@ func refill(ctx context.Context, tf torrentfile.File, peerID [20]byte) <-chan []
 	return more
 }
 
-func lookupDHT(ctx context.Context, infoHash [20]byte, want int) ([]netip.AddrPort, error) {
+func withDHT[T any](ctx context.Context, fn func(context.Context, *dht.Client, []netip.AddrPort) (T, error)) (T, error) {
+	var zero T
 	ctx, cancel := context.WithTimeout(ctx, dhtTimeout)
 	defer cancel()
 	conn, err := net.ListenPacket("udp4", ":0")
 	if err != nil {
-		return nil, err
+		return zero, err
 	}
 	client, err := dht.NewClient(conn)
 	if err != nil {
 		conn.Close()
-		return nil, err
+		return zero, err
 	}
 	defer client.Close()
-	return client.FindPeers(ctx, infoHash, resolve(ctx, bootstrapNodes), want)
+	return fn(ctx, client, resolve(ctx, bootstrapNodes))
+}
+
+func lookupDHT(ctx context.Context, infoHash [20]byte, want int) ([]netip.AddrPort, error) {
+	return withDHT(ctx, func(ctx context.Context, c *dht.Client, boot []netip.AddrPort) ([]netip.AddrPort, error) {
+		return c.FindPeers(ctx, infoHash, boot, want)
+	})
+}
+
+func announceDHT(ctx context.Context, infoHash [20]byte) (int, error) {
+	return withDHT(ctx, func(ctx context.Context, c *dht.Client, boot []netip.AddrPort) (int, error) {
+		return c.Announce(ctx, infoHash, boot, listenPort)
+	})
+}
+
+func keepAnnouncing(ctx context.Context, infoHash [20]byte, report func(int, error)) {
+	for {
+		accepted, err := announceDHT(ctx, infoHash)
+		if report != nil {
+			report(accepted, err)
+		}
+		select {
+		case <-time.After(dhtAnnounceEvery):
+		case <-ctx.Done():
+			return
+		}
+	}
 }
 
 func resolve(ctx context.Context, hosts []string) []netip.AddrPort {

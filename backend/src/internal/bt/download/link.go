@@ -11,20 +11,35 @@ import (
 	"trickle/internal/bt/peer"
 )
 
+const outboxSize = 128
+
 type link struct {
 	c       *peer.Conn
 	s       *session
 	choking bool
+	outbox  chan *peer.Message
 }
 
+// register before the bitfield snapshot; queued haves wait until the bitfield is sent
 func (s *session) newLink(c *peer.Conn) (*link, error) {
-	l := &link{c: c, s: s, choking: true}
+	l := &link{c: c, s: s, choking: true, outbox: make(chan *peer.Message, outboxSize)}
+	s.register(l)
 	if bf := s.bitfield(); bf.Count() > 0 {
 		if err := c.Send(&peer.Message{ID: peer.BitfieldMsg, Payload: bf}); err != nil {
+			s.dropLink(l)
 			return nil, err
 		}
 	}
+	go l.drain()
 	return l, nil
+}
+
+func (l *link) drain() {
+	for m := range l.outbox {
+		if l.c.Send(m) != nil {
+			return
+		}
+	}
 }
 
 func (l *link) read(ctx context.Context) (*peer.Message, error) {
@@ -70,6 +85,7 @@ func (l *link) serve(ctx context.Context, m *peer.Message) error {
 	if err := l.s.up.WaitN(ctx, len(data)); err != nil {
 		return err
 	}
+	l.s.uploaded.Add(int64(len(data)))
 	return l.c.Send(peer.NewPiece(req.Index, req.Begin, data))
 }
 
@@ -85,7 +101,11 @@ func (s *session) worker(ctx context.Context, addr netip.AddrPort, queue chan wo
 	defer stop()
 
 	l, err := s.newLink(c)
-	if err != nil || c.Send(&peer.Message{ID: peer.Interested}) != nil {
+	if err != nil {
+		return
+	}
+	defer s.dropLink(l)
+	if c.Send(&peer.Message{ID: peer.Interested}) != nil {
 		return
 	}
 	c.SetDeadline(time.Now().Add(unchokeWait))
@@ -126,7 +146,6 @@ func (s *session) worker(ctx context.Context, addr netip.AddrPort, queue chan wo
 			}
 			return
 		}
-		c.Send(peer.NewHave(w.index))
 		select {
 		case results <- result{index: w.index, data: data}:
 		case <-ctx.Done():
@@ -150,6 +169,7 @@ func (s *session) serveIncoming(ctx context.Context, nc net.Conn) {
 	if err != nil {
 		return
 	}
+	defer s.dropLink(l)
 	for {
 		c.SetDeadline(time.Now().Add(idleTimeout))
 		if _, err := l.read(ctx); err != nil {

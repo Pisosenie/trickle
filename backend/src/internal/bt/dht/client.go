@@ -123,13 +123,36 @@ func (c *Client) Ping(ctx context.Context, addr netip.AddrPort) ([20]byte, error
 	return id, nil
 }
 
-func (c *Client) getPeers(ctx context.Context, addr netip.AddrPort, infoHash [20]byte) (node, []netip.AddrPort, []node, error) {
+type getPeersReply struct {
+	from  node
+	token string
+	peers []netip.AddrPort
+	nodes []node
+}
+
+func (c *Client) getPeers(ctx context.Context, addr netip.AddrPort, infoHash [20]byte) (getPeersReply, error) {
 	r, err := c.query(ctx, addr, "get_peers", map[string]any{"info_hash": string(infoHash[:])})
 	if err != nil {
-		return node{}, nil, nil, err
+		return getPeersReply{}, err
 	}
 	id, _ := nodeID(r)
+	token, _ := r["token"].(string)
 	values, _ := r["values"].([]any)
 	nodes, _ := r["nodes"].(string)
-	return node{id: id, addr: addr}, compactPeers(values), compactNodes(nodes), nil
+	return getPeersReply{
+		from:  node{id: id, addr: addr},
+		token: token,
+		peers: compactPeers(values),
+		nodes: compactNodes(nodes),
+	}, nil
+}
+
+func (c *Client) announcePeer(ctx context.Context, addr netip.AddrPort, infoHash [20]byte, port int, token string) error {
+	_, err := c.query(ctx, addr, "announce_peer", map[string]any{
+		"info_hash":    string(infoHash[:]),
+		"port":         port,
+		"token":        token,
+		"implied_port": 0,
+	})
+	return err
 }

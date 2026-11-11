@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"math"
 	"net/netip"
 	"slices"
+	"sync"
+	"sync/atomic"
 )
 
 const (
@@ -15,14 +18,52 @@ const (
 	maxKnown   = 64
 )
 
-type lookupResult struct {
-	peers []netip.AddrPort
-	nodes []node
+// FindPeers walks the DHT towards infoHash and collects the peers nodes know about
+func (c *Client) FindPeers(ctx context.Context, infoHash [20]byte, bootstrap []netip.AddrPort, want int) ([]netip.AddrPort, error) {
+	peers, _, err := c.traverse(ctx, infoHash, bootstrap, want)
+	if err != nil && len(peers) == 0 {
+		return nil, err
+	}
+	if len(peers) == 0 {
+		return nil, errors.New("the DHT knows no peers for this torrent")
+	}
+	return peers, nil
 }
 
-// FindPeers walks the DHT towards infoHash: ask the closest nodes we know,
-// learn closer ones from their answers, and collect peers on the way
-func (c *Client) FindPeers(ctx context.Context, infoHash [20]byte, bootstrap []netip.AddrPort, want int) ([]netip.AddrPort, error) {
+// Announce tells the k nodes closest to infoHash that we serve it on port, with the token each handed out
+func (c *Client) Announce(ctx context.Context, infoHash [20]byte, bootstrap []netip.AddrPort, port int) (int, error) {
+	_, replies, err := c.traverse(ctx, infoHash, bootstrap, math.MaxInt)
+	if err != nil && len(replies) == 0 {
+		return 0, err
+	}
+	var withToken []getPeersReply
+	for _, r := range replies {
+		if r.token != "" {
+			withToken = append(withToken, r)
+		}
+	}
+	slices.SortFunc(withToken, func(a, b getPeersReply) int { return compareDistance(a.from.id, b.from.id, infoHash) })
+	withToken = withToken[:min(k, len(withToken))]
+
+	var wg sync.WaitGroup
+	var accepted atomic.Int32
+	for _, r := range withToken {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if c.announcePeer(ctx, r.from.addr, infoHash, port, r.token) == nil {
+				accepted.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	if accepted.Load() == 0 {
+		return 0, errors.New("no DHT node accepted the announce")
+	}
+	return int(accepted.Load()), nil
+}
+
+func (c *Client) traverse(ctx context.Context, infoHash [20]byte, bootstrap []netip.AddrPort, want int) ([]netip.AddrPort, []getPeersReply, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -31,6 +72,7 @@ func (c *Client) FindPeers(ctx context.Context, infoHash [20]byte, bootstrap []n
 	asked := map[netip.AddrPort]bool{}
 	seen := map[netip.AddrPort]bool{}
 	var peers []netip.AddrPort
+	var replies []getPeersReply
 
 	pick := func() (netip.AddrPort, bool) {
 		for len(queue) > 0 {
@@ -48,7 +90,11 @@ func (c *Client) FindPeers(ctx context.Context, infoHash [20]byte, bootstrap []n
 		return netip.AddrPort{}, false
 	}
 
-	results := make(chan lookupResult)
+	type outcome struct {
+		reply getPeersReply
+		err   error
+	}
+	results := make(chan outcome)
 	inflight, queries := 0, 0
 	for {
 		for inflight < alpha && queries < maxQueries {
@@ -60,38 +106,38 @@ func (c *Client) FindPeers(ctx context.Context, infoHash [20]byte, bootstrap []n
 			inflight++
 			queries++
 			go func() {
-				_, found, nodes, _ := c.getPeers(ctx, addr, infoHash)
+				r, err := c.getPeers(ctx, addr, infoHash)
 				select {
-				case results <- lookupResult{peers: found, nodes: nodes}:
+				case results <- outcome{reply: r, err: err}:
 				case <-ctx.Done():
 				}
 			}()
 		}
 		if inflight == 0 {
-			break
+			return peers, replies, nil
 		}
 
 		select {
-		case r := <-results:
+		case o := <-results:
 			inflight--
-			for _, p := range r.peers {
+			if o.err != nil {
+				continue
+			}
+			replies = append(replies, o.reply)
+			for _, p := range o.reply.peers {
 				if !seen[p] {
 					seen[p] = true
 					peers = append(peers, p)
 				}
 			}
-			known = merge(known, r.nodes, asked, infoHash)
+			known = merge(known, o.reply.nodes, asked, infoHash)
 		case <-ctx.Done():
-			return peers, ctx.Err()
+			return peers, replies, ctx.Err()
 		}
 		if len(peers) >= want {
-			break
+			return peers, replies, nil
 		}
 	}
-	if len(peers) == 0 {
-		return nil, errors.New("the DHT knows no peers for this torrent")
-	}
-	return peers, nil
 }
 
 func merge(known, found []node, asked map[netip.AddrPort]bool, target [20]byte) []node {

@@ -54,7 +54,7 @@ func fromMagnet(uri string) error {
 	if err != nil {
 		return err
 	}
-	peers := gatherPeers(context.Background(), link.InfoHash, supportedTrackers(link.Trackers), peerID, 1)
+	peers := gatherPeers(context.Background(), supportedTrackers(link.Trackers), request(link.InfoHash, peerID, 1, tracker.EventStarted))
 	if len(peers) == 0 {
 		return fmt.Errorf("found no peers for %x", link.InfoHash)
 	}
