@@ -18,13 +18,11 @@ import (
 )
 
 const (
-	dialTimeout   = 5 * time.Second
-	unchokeWait   = 30 * time.Second
-	idleTimeout   = 2 * time.Minute
-	idleAfterMiss = time.Second
-	maxRequest    = 128 << 10
-	endgamePoll   = 500 * time.Millisecond
-	maxFetchers   = 2
+	dialTimeout = 5 * time.Second
+	unchokeWait = 30 * time.Second
+	idleTimeout = 2 * time.Minute
+	maxRequest  = 128 << 10
+	maxFetchers = 2
 )
 
 type Config struct {
@@ -54,13 +52,19 @@ type session struct {
 	down  *rate.Limiter
 	up    *rate.Limiter
 
+	// set before any link starts; nil while only seeding
+	results chan result
+	exits   chan bool
+
 	mu       sync.Mutex
 	have     peer.Bitfield
 	done     int
+	pending  map[int]work
 	fetching map[int]work
 	fetchers map[int]int
 	links    map[*link]struct{}
 
+	incoming   atomic.Int32
 	downloaded atomic.Int64
 	uploaded   atomic.Int64
 }
@@ -82,6 +86,7 @@ func open(cfg Config) (*session, error) {
 		down:     limiter(cfg.DownloadLimit),
 		up:       limiter(cfg.UploadLimit),
 		have:     make(peer.Bitfield, (len(verified)+7)/8),
+		pending:  map[int]work{},
 		fetching: map[int]work{},
 		fetchers: map[int]int{},
 		links:    map[*link]struct{}{},
@@ -90,6 +95,8 @@ func open(cfg Config) (*session, error) {
 		if ok {
 			s.have = s.have.With(i)
 			s.done++
+		} else {
+			s.pending[i] = work{index: i, hash: cfg.Torrent.Pieces[i], length: int(cfg.Torrent.PieceSize(i))}
 		}
 	}
 	return s, nil
@@ -122,61 +129,14 @@ func (s *session) markHave(index int) bool {
 	}
 	s.have = s.have.With(index)
 	s.done++
+	delete(s.pending, index)
 	return true
 }
 
-func (s *session) startFetch(w work) {
+func (s *session) missing() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	original := w
-	original.duplicate = false
-	s.fetching[w.index] = original
-	s.fetchers[w.index]++
-}
-
-func (s *session) endFetch(index int) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.fetchers[index]--; s.fetchers[index] <= 0 {
-		delete(s.fetchers, index)
-		delete(s.fetching, index)
-	}
-}
-
-// endgame: when the queue is empty, help with a piece another peer is already fetching
-func (s *session) endgamePick(has peer.Bitfield) (work, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for index, w := range s.fetching {
-		if has.Has(index) && !s.have.Has(index) && s.fetchers[index] < maxFetchers {
-			w.duplicate = true
-			return w, true
-		}
-	}
-	return work{}, false
-}
-
-func (s *session) next(ctx context.Context, queue chan work, has peer.Bitfield) (work, bool) {
-	timer := time.NewTimer(endgamePoll)
-	defer timer.Stop()
-	for {
-		select {
-		case w := <-queue:
-			return w, true
-		default:
-		}
-		if w, ok := s.endgamePick(has); ok {
-			return w, true
-		}
-		timer.Reset(endgamePoll)
-		select {
-		case w := <-queue:
-			return w, true
-		case <-timer.C:
-		case <-ctx.Done():
-			return work{}, false
-		}
-	}
+	return len(s.tf.Pieces) - s.done
 }
 
 func (s *session) register(l *link) {
@@ -226,12 +186,12 @@ func Download(ctx context.Context, cfg Config) error {
 	}
 	defer s.store.Close()
 	s.progress()
-
-	missing := s.missing()
-	if len(missing) == 0 {
+	if s.missing() == 0 {
 		return s.store.Sync()
 	}
 
+	s.results = make(chan result)
+	s.exits = make(chan bool)
 	ctx, cancel := context.WithCancel(ctx)
 	var serving, workers sync.WaitGroup
 	defer serving.Wait()
@@ -239,35 +199,25 @@ func Download(ctx context.Context, cfg Config) error {
 	defer cancel()
 	s.listen(ctx, &serving)
 
-	queue := make(chan work, len(missing))
-	for _, w := range missing {
-		queue <- w
-	}
-	results := make(chan result)
-	exits := make(chan struct{})
 	peers := newPool(cfg.MaxPeers)
 	launch := func(addrs []netip.AddrPort) {
 		for _, addr := range peers.admit(time.Now(), addrs) {
 			workers.Add(1)
 			go func() {
 				defer workers.Done()
-				s.worker(ctx, addr, queue, results)
-				select {
-				case exits <- struct{}{}:
-				case <-ctx.Done():
-				}
+				s.dialPeer(ctx, addr)
 			}()
 		}
 	}
 	launch(cfg.Peers)
 
 	more := cfg.MorePeers
-	for left := len(missing); left > 0; {
-		if peers.active == 0 && more == nil {
-			return fmt.Errorf("all peers are gone with %d of %d pieces missing", left, len(s.tf.Pieces))
+	for s.missing() > 0 {
+		if peers.active == 0 && s.incoming.Load() == 0 && more == nil {
+			return fmt.Errorf("all peers are gone with %d of %d pieces missing", s.missing(), len(s.tf.Pieces))
 		}
 		select {
-		case r := <-results:
+		case r := <-s.results:
 			if s.has(r.index) {
 				continue
 			}
@@ -278,10 +228,11 @@ func Download(ctx context.Context, cfg Config) error {
 			s.downloaded.Add(int64(len(r.data)))
 			s.announceHave(r.index)
 			s.progress()
-			left--
-		case <-exits:
-			peers.exited()
-			launch(nil)
+		case outgoing := <-s.exits:
+			if outgoing {
+				peers.exited()
+				launch(nil)
+			}
 		case addrs, ok := <-more:
 			if !ok {
 				more = nil
@@ -304,7 +255,7 @@ func Seed(ctx context.Context, cfg Config) error {
 		return err
 	}
 	defer s.store.Close()
-	if missing := len(s.missing()); missing > 0 {
+	if missing := s.missing(); missing > 0 {
 		return fmt.Errorf("%d of %d pieces are missing or damaged, download them first", missing, len(s.tf.Pieces))
 	}
 	var serving sync.WaitGroup
@@ -312,16 +263,6 @@ func Seed(ctx context.Context, cfg Config) error {
 	<-ctx.Done()
 	serving.Wait()
 	return nil
-}
-
-func (s *session) missing() []work {
-	var todo []work
-	for i, hash := range s.tf.Pieces {
-		if !s.has(i) {
-			todo = append(todo, work{index: i, hash: hash, length: int(s.tf.PieceSize(i))})
-		}
-	}
-	return todo
 }
 
 func (s *session) listen(ctx context.Context, serving *sync.WaitGroup) {
@@ -339,11 +280,25 @@ func (s *session) listen(ctx context.Context, serving *sync.WaitGroup) {
 			if err != nil {
 				return
 			}
+			s.incoming.Add(1)
 			serving.Add(1)
 			go func() {
 				defer serving.Done()
-				s.serveIncoming(ctx, nc)
+				s.acceptPeer(ctx, nc)
 			}()
 		}
 	}()
+}
+
+func (s *session) exited(ctx context.Context, outgoing bool) {
+	if !outgoing {
+		s.incoming.Add(-1)
+	}
+	if s.exits == nil {
+		return
+	}
+	select {
+	case s.exits <- outgoing:
+	case <-ctx.Done():
+	}
 }

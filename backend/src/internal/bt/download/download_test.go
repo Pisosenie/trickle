@@ -509,3 +509,53 @@ func TestFinishedPiecesAreAnnouncedToEveryPeer(t *testing.T) {
 		}
 	}
 }
+
+// visitor dials us like a seeder that found us through a tracker, and serves real data
+func visitor(t *testing.T, fx fixture, addr net.Addr) {
+	t.Helper()
+	data := fx.files["image.iso"]
+	all := bytes.Repeat([]byte{0xff}, (len(fx.tf.Pieces)+7)/8)
+	go func() {
+		nc, err := net.Dial("tcp", addr.String())
+		if err != nil {
+			return
+		}
+		defer nc.Close()
+		nc.Write(peer.Handshake{InfoHash: fx.tf.InfoHash, PeerID: [20]byte{'-', 'V', 'I'}}.Bytes())
+		if _, err := peer.ReadHandshake(nc); err != nil {
+			return
+		}
+		nc.Write((&peer.Message{ID: peer.BitfieldMsg, Payload: all}).Bytes())
+		nc.Write((&peer.Message{ID: peer.Unchoke}).Bytes())
+		for {
+			m, err := peer.ReadMessage(nc)
+			if err != nil {
+				return
+			}
+			if m == nil || m.ID != peer.Request {
+				continue
+			}
+			req, _ := peer.ParseRequest(m)
+			off := req.Index*pieceLength + req.Begin
+			if _, err := nc.Write(peer.NewPiece(req.Index, req.Begin, data[off:off+req.Length]).Bytes()); err != nil {
+				return
+			}
+		}
+	}()
+}
+
+func TestDownloadsFromIncomingPeers(t *testing.T) {
+	fx := newFixture(t, false)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiting := make(chan []netip.AddrPort)
+	visitor(t, fx, ln.Addr())
+
+	out := t.TempDir()
+	if _, err := download(t, Config{Torrent: fx.tf, PeerID: ourID, MorePeers: waiting, Listener: ln, Dir: out}); err != nil {
+		t.Fatalf("a seeder that connected to us should be used: %v", err)
+	}
+	fx.check(t, out)
+}

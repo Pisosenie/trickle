@@ -2,30 +2,38 @@ package download
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net"
 	"net/netip"
+	"sync/atomic"
 	"time"
 
 	"trickle/internal/bt/peer"
 )
 
-const outboxSize = 128
+const (
+	outboxSize = 128
+	tick       = 250 * time.Millisecond
+	keepAlive  = 90 * time.Second
+)
 
 type link struct {
-	c       *peer.Conn
-	s       *session
-	choking bool
-	outbox  chan *peer.Message
+	c          *peer.Conn
+	s          *session
+	outgoing   bool
+	choking    bool
+	interested bool
+	outbox     chan *peer.Message
+	lastSent   atomic.Int64
 }
 
 // register before the bitfield snapshot; queued haves wait until the bitfield is sent
-func (s *session) newLink(c *peer.Conn) (*link, error) {
-	l := &link{c: c, s: s, choking: true, outbox: make(chan *peer.Message, outboxSize)}
+func (s *session) newLink(c *peer.Conn, outgoing bool) (*link, error) {
+	l := &link{c: c, s: s, outgoing: outgoing, choking: true, outbox: make(chan *peer.Message, outboxSize)}
+	l.lastSent.Store(time.Now().UnixNano())
 	s.register(l)
 	if bf := s.bitfield(); bf.Count() > 0 {
-		if err := c.Send(&peer.Message{ID: peer.BitfieldMsg, Payload: bf}); err != nil {
+		if err := l.send(&peer.Message{ID: peer.BitfieldMsg, Payload: bf}); err != nil {
 			s.dropLink(l)
 			return nil, err
 		}
@@ -34,34 +42,207 @@ func (s *session) newLink(c *peer.Conn) (*link, error) {
 	return l, nil
 }
 
+func (l *link) send(m *peer.Message) error {
+	l.lastSent.Store(time.Now().UnixNano())
+	return l.c.Send(m)
+}
+
 func (l *link) drain() {
 	for m := range l.outbox {
-		if l.c.Send(m) != nil {
+		if l.send(m) != nil {
 			return
 		}
 	}
 }
 
-func (l *link) read(ctx context.Context) (*peer.Message, error) {
-	m, err := l.c.Read()
-	if err != nil || m == nil {
-		return m, err
+func (s *session) dialPeer(ctx context.Context, addr netip.AddrPort) {
+	defer s.exited(ctx, true)
+	dialCtx, cancel := context.WithTimeout(ctx, dialTimeout)
+	c, err := peer.Dial(dialCtx, addr, s.tf.InfoHash, s.cfg.PeerID)
+	cancel()
+	if err != nil {
+		return
 	}
+	s.runLink(ctx, c, true)
+}
+
+func (s *session) acceptPeer(ctx context.Context, nc net.Conn) {
+	defer s.exited(ctx, false)
+	hsCtx, cancel := context.WithTimeout(ctx, dialTimeout)
+	c, err := peer.Accept(hsCtx, nc, s.tf.InfoHash, s.cfg.PeerID)
+	cancel()
+	if err != nil {
+		nc.Close()
+		return
+	}
+	s.runLink(ctx, c, false)
+}
+
+// runLink reads the socket on its own goroutine, so the loop can serve, download and keep time at once
+func (s *session) runLink(ctx context.Context, c *peer.Conn, outgoing bool) {
+	defer c.Close()
+	stop := context.AfterFunc(ctx, func() { c.Close() })
+	defer stop()
+
+	l, err := s.newLink(c, outgoing)
+	if err != nil {
+		return
+	}
+	defer s.dropLink(l)
+
+	msgs := make(chan *peer.Message)
+	gone := make(chan struct{})
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		defer close(gone)
+		for {
+			m, err := c.Receive()
+			if err != nil {
+				return
+			}
+			if m == nil {
+				continue
+			}
+			select {
+			case msgs <- m:
+			case <-done:
+				return
+			}
+		}
+	}()
+	l.loop(ctx, msgs, gone)
+}
+
+func (l *link) loop(ctx context.Context, msgs <-chan *peer.Message, gone <-chan struct{}) {
+	ticker := time.NewTicker(tick)
+	defer ticker.Stop()
+
+	var cur *pieceProgress
+	defer func() {
+		if cur != nil {
+			l.s.release(cur.w, !cur.w.duplicate)
+		}
+	}()
+	downloading := l.s.results != nil
+	lastHeard := time.Now()
+	var chokedSince time.Time
+
+	for {
+		if downloading {
+			if l.updateInterest() != nil {
+				return
+			}
+			if cur == nil && l.interested && !l.c.Choked {
+				if w, ok := l.s.assign(l.c.Bitfield); ok {
+					cur = newProgress(w, time.Now())
+				}
+			}
+			if cur != nil && !l.c.Choked && cur.request(l.send) != nil {
+				return
+			}
+		}
+
+		select {
+		case m := <-msgs:
+			lastHeard = time.Now()
+			if l.c.Apply(m) != nil || l.handle(ctx, m) != nil {
+				return
+			}
+			if cur == nil {
+				continue
+			}
+			switch m.ID {
+			case peer.Choke:
+				cur.choked()
+			case peer.Piece:
+				block, err := peer.ParsePiece(m)
+				if err != nil {
+					return
+				}
+				complete, err := cur.block(block, time.Now())
+				if err != nil || l.s.down.WaitN(ctx, len(block.Data)) != nil {
+					return
+				}
+				if !complete {
+					continue
+				}
+				finished := cur
+				cur = nil
+				data, err := finished.verify()
+				l.s.release(finished.w, err != nil && !finished.w.duplicate)
+				if err != nil {
+					return
+				}
+				select {
+				case l.s.results <- result{index: finished.w.index, data: data}:
+				case <-ctx.Done():
+					return
+				}
+			}
+
+		case now := <-ticker.C:
+			if cur != nil {
+				cur.expire(now)
+			}
+			if cur != nil && l.s.has(cur.w.index) {
+				cur.cancel(l.send)
+				l.s.release(cur.w, false)
+				cur = nil
+			}
+			if cur != nil && now.Sub(cur.lastData) > pieceTimeout || now.Sub(lastHeard) > idleTimeout {
+				return
+			}
+			if l.outgoing && l.interested && l.c.Choked {
+				if chokedSince.IsZero() {
+					chokedSince = now
+				} else if now.Sub(chokedSince) > unchokeWait {
+					return
+				}
+			} else {
+				chokedSince = time.Time{}
+			}
+			if now.Sub(time.Unix(0, l.lastSent.Load())) > keepAlive && l.send(nil) != nil {
+				return
+			}
+
+		case <-gone:
+			return
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func (l *link) updateInterest() error {
+	want := l.s.wants(l.c.Bitfield)
+	if want == l.interested {
+		return nil
+	}
+	l.interested = want
+	id := peer.NotInterested
+	if want {
+		id = peer.Interested
+	}
+	return l.send(&peer.Message{ID: id})
+}
+
+func (l *link) handle(ctx context.Context, m *peer.Message) error {
 	switch m.ID {
 	case peer.Interested:
 		if l.choking {
 			l.choking = false
-			return m, l.c.Send(&peer.Message{ID: peer.Unchoke})
+			return l.send(&peer.Message{ID: peer.Unchoke})
 		}
 	case peer.NotInterested:
 		if !l.choking {
 			l.choking = true
-			return m, l.c.Send(&peer.Message{ID: peer.Choke})
+			return l.send(&peer.Message{ID: peer.Choke})
 		}
 	case peer.Request:
-		return m, l.serve(ctx, m)
+		return l.serve(ctx, m)
 	}
-	return m, nil
+	return nil
 }
 
 func (l *link) serve(ctx context.Context, m *peer.Message) error {
@@ -86,105 +267,5 @@ func (l *link) serve(ctx context.Context, m *peer.Message) error {
 		return err
 	}
 	l.s.uploaded.Add(int64(len(data)))
-	return l.c.Send(peer.NewPiece(req.Index, req.Begin, data))
-}
-
-func (s *session) worker(ctx context.Context, addr netip.AddrPort, queue chan work, results chan<- result) {
-	dialCtx, cancel := context.WithTimeout(ctx, dialTimeout)
-	c, err := peer.Dial(dialCtx, addr, s.tf.InfoHash, s.cfg.PeerID)
-	cancel()
-	if err != nil {
-		return
-	}
-	defer c.Close()
-	stop := context.AfterFunc(ctx, func() { c.Close() })
-	defer stop()
-
-	l, err := s.newLink(c)
-	if err != nil {
-		return
-	}
-	defer s.dropLink(l)
-	if c.Send(&peer.Message{ID: peer.Interested}) != nil {
-		return
-	}
-	c.SetDeadline(time.Now().Add(unchokeWait))
-	for c.Choked {
-		if _, err := l.read(ctx); err != nil {
-			return
-		}
-	}
-	c.SetDeadline(time.Time{})
-
-	misses := 0
-	for {
-		w, ok := s.next(ctx, queue, c.Bitfield)
-		if !ok {
-			return
-		}
-		if !c.Bitfield.Has(w.index) {
-			queue <- w
-			if misses++; misses >= cap(queue) {
-				misses = 0
-				if !sleep(ctx, idleAfterMiss) {
-					return
-				}
-			}
-			continue
-		}
-		misses = 0
-
-		s.startFetch(w)
-		data, err := fetchPiece(ctx, l, w)
-		s.endFetch(w.index)
-		if errors.Is(err, errAlreadyHave) {
-			continue
-		}
-		if err != nil {
-			if !w.duplicate {
-				queue <- w
-			}
-			return
-		}
-		select {
-		case results <- result{index: w.index, data: data}:
-		case <-ctx.Done():
-			return
-		}
-	}
-}
-
-func (s *session) serveIncoming(ctx context.Context, nc net.Conn) {
-	defer nc.Close()
-	stop := context.AfterFunc(ctx, func() { nc.Close() })
-	defer stop()
-
-	hsCtx, cancel := context.WithTimeout(ctx, dialTimeout)
-	c, err := peer.Accept(hsCtx, nc, s.tf.InfoHash, s.cfg.PeerID)
-	cancel()
-	if err != nil {
-		return
-	}
-	l, err := s.newLink(c)
-	if err != nil {
-		return
-	}
-	defer s.dropLink(l)
-	for {
-		c.SetDeadline(time.Now().Add(idleTimeout))
-		if _, err := l.read(ctx); err != nil {
-			return
-		}
-	}
-}
-
-func sleep(ctx context.Context, d time.Duration) bool {
-	t := time.NewTimer(d)
-	defer t.Stop()
-	select {
-	case <-t.C:
-		return true
-	case <-ctx.Done():
-		return false
-	}
+	return l.send(peer.NewPiece(req.Index, req.Begin, data))
 }

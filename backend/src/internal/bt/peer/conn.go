@@ -77,12 +77,21 @@ func (c *Conn) Send(m *Message) error {
 	return err
 }
 
-// Read returns the next message and applies choke, unchoke, have and bitfield to the connection state
+// Read is Receive followed by Apply
 func (c *Conn) Read() (*Message, error) {
-	m, err := ReadMessage(c.nc)
+	m, err := c.Receive()
 	if err != nil || m == nil {
 		return m, err
 	}
+	return m, c.Apply(m)
+}
+
+// Receive reads one message without touching the connection state, so it can run on its own goroutine
+func (c *Conn) Receive() (*Message, error) {
+	return ReadMessage(c.nc)
+}
+
+func (c *Conn) Apply(m *Message) error {
 	switch m.ID {
 	case Choke:
 		c.Choked = true
@@ -93,11 +102,11 @@ func (c *Conn) Read() (*Message, error) {
 	case Have:
 		index, err := ParseHave(m)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		c.Bitfield = c.Bitfield.With(index)
 	}
-	return m, nil
+	return nil
 }
 
 func (c *Conn) SetDeadline(t time.Time) error {

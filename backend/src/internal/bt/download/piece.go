@@ -1,7 +1,6 @@
 package download
 
 import (
-	"context"
 	"crypto/sha1"
 	"errors"
 	"fmt"
@@ -11,15 +10,14 @@ import (
 )
 
 const (
-	blockSize    = 16 << 10
-	maxBacklog   = 5
-	pieceTimeout = 30 * time.Second
+	blockSize      = 16 << 10
+	maxBacklog     = 5
+	pieceTimeout   = 30 * time.Second
+	overtakenAfter = time.Second
+	requestTimeout = 15 * time.Second
 )
 
-var (
-	errHashMismatch = errors.New("piece failed SHA-1 check")
-	errAlreadyHave  = errors.New("piece finished by another peer")
-)
+var errHashMismatch = errors.New("piece failed SHA-1 check")
 
 type work struct {
 	index     int
@@ -33,87 +31,111 @@ type result struct {
 	data  []byte
 }
 
-func fetchPiece(ctx context.Context, l *link, w work) ([]byte, error) {
-	c := l.c
-	c.SetDeadline(time.Now().Add(pieceTimeout))
-	defer c.SetDeadline(time.Time{})
-
-	blocks := (w.length + blockSize - 1) / blockSize
-	received := make([]bool, blocks)
-	inFlight := make([]bool, blocks)
-	left, backlog := blocks, 0
-	buf := make([]byte, w.length)
-
-	for left > 0 {
-		if l.s.has(w.index) {
-			cancelInFlight(c, w, inFlight)
-			return nil, errAlreadyHave
-		}
-		if !c.Choked {
-			for i := 0; i < blocks && backlog < maxBacklog; i++ {
-				if received[i] || inFlight[i] {
-					continue
-				}
-				begin := i * blockSize
-				if err := c.Send(peer.NewRequest(w.index, begin, min(blockSize, w.length-begin))); err != nil {
-					return nil, err
-				}
-				inFlight[i] = true
-				backlog++
-			}
-		}
-
-		m, err := l.read(ctx)
-		if err != nil {
-			return nil, err
-		}
-		if m == nil {
-			continue
-		}
-		switch m.ID {
-		case peer.Choke:
-			// a choking peer drops our pending requests; ask again after unchoke
-			clear(inFlight)
-			backlog = 0
-		case peer.Piece:
-			block, err := peer.ParsePiece(m)
-			if err != nil {
-				return nil, err
-			}
-			if block.Index != w.index {
-				continue
-			}
-			i := block.Begin / blockSize
-			if block.Begin%blockSize != 0 || i >= blocks || len(block.Data) != min(blockSize, w.length-block.Begin) {
-				return nil, fmt.Errorf("%w: unexpected block %d@%d", peer.ErrProtocol, block.Index, block.Begin)
-			}
-			if received[i] {
-				continue
-			}
-			copy(buf[block.Begin:], block.Data)
-			received[i] = true
-			left--
-			if inFlight[i] {
-				inFlight[i] = false
-				backlog--
-			}
-			if err := l.s.down.WaitN(ctx, len(block.Data)); err != nil {
-				return nil, err
-			}
-		}
-	}
-
-	if sha1.Sum(buf) != w.hash {
-		return nil, errHashMismatch
-	}
-	return buf, nil
+type pieceProgress struct {
+	w        work
+	buf      []byte
+	received []bool
+	inFlight []bool
+	sentAt   []time.Time
+	left     int
+	backlog  int
+	lastData time.Time
 }
 
-func cancelInFlight(c *peer.Conn, w work, inFlight []bool) {
-	for i, pending := range inFlight {
-		if pending {
-			begin := i * blockSize
-			c.Send(peer.NewCancel(w.index, begin, min(blockSize, w.length-begin)))
+func newProgress(w work, now time.Time) *pieceProgress {
+	blocks := (w.length + blockSize - 1) / blockSize
+	return &pieceProgress{
+		w:        w,
+		buf:      make([]byte, w.length),
+		received: make([]bool, blocks),
+		inFlight: make([]bool, blocks),
+		sentAt:   make([]time.Time, blocks),
+		left:     blocks,
+		lastData: now,
+	}
+}
+
+func (p *pieceProgress) blockSize(i int) int {
+	return min(blockSize, p.w.length-i*blockSize)
+}
+
+func (p *pieceProgress) request(send func(*peer.Message) error) error {
+	for i := range p.received {
+		if p.backlog >= maxBacklog {
+			return nil
+		}
+		if p.received[i] || p.inFlight[i] {
+			continue
+		}
+		if err := send(peer.NewRequest(p.w.index, i*blockSize, p.blockSize(i))); err != nil {
+			return err
+		}
+		p.inFlight[i] = true
+		p.sentAt[i] = time.Now()
+		p.backlog++
+	}
+	return nil
+}
+
+// a choking peer drops our pending requests; they are asked again after unchoke
+func (p *pieceProgress) choked() {
+	clear(p.inFlight)
+	p.backlog = 0
+}
+
+// blocks of other pieces are leftovers of a cancelled piece and are ignored
+func (p *pieceProgress) block(b peer.Block, now time.Time) (bool, error) {
+	if b.Index != p.w.index {
+		return false, nil
+	}
+	i := b.Begin / blockSize
+	if b.Begin%blockSize != 0 || i >= len(p.received) || len(b.Data) != p.blockSize(i) {
+		return false, fmt.Errorf("%w: unexpected block %d@%d", peer.ErrProtocol, b.Index, b.Begin)
+	}
+	if p.inFlight[i] {
+		p.inFlight[i] = false
+		p.backlog--
+		p.overtaken(p.sentAt[i], now)
+	}
+	if !p.received[i] {
+		copy(p.buf[b.Begin:], b.Data)
+		p.received[i] = true
+		p.left--
+		p.lastData = now
+	}
+	return p.left == 0, nil
+}
+
+// peers answer requests in order, so a block asked for before one that just arrived was probably lost
+func (p *pieceProgress) overtaken(arrivedSentAt, now time.Time) {
+	for j, pending := range p.inFlight {
+		if pending && p.sentAt[j].Before(arrivedSentAt) && now.Sub(p.sentAt[j]) > overtakenAfter {
+			p.inFlight[j] = false
+			p.backlog--
 		}
 	}
+}
+
+func (p *pieceProgress) expire(now time.Time) {
+	for j, pending := range p.inFlight {
+		if pending && now.Sub(p.sentAt[j]) > requestTimeout {
+			p.inFlight[j] = false
+			p.backlog--
+		}
+	}
+}
+
+func (p *pieceProgress) cancel(send func(*peer.Message) error) {
+	for i, pending := range p.inFlight {
+		if pending {
+			send(peer.NewCancel(p.w.index, i*blockSize, p.blockSize(i)))
+		}
+	}
+}
+
+func (p *pieceProgress) verify() ([]byte, error) {
+	if sha1.Sum(p.buf) != p.w.hash {
+		return nil, errHashMismatch
+	}
+	return p.buf, nil
 }
