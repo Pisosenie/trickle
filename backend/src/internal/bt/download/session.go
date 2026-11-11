@@ -57,7 +57,8 @@ type session struct {
 	exits   chan bool
 	found   chan []netip.AddrPort
 
-	pexEvery time.Duration
+	pexEvery     time.Duration
+	rechokeEvery time.Duration
 
 	mu       sync.Mutex
 	have     peer.Bitfield
@@ -83,17 +84,18 @@ func open(cfg Config) (*session, error) {
 		return nil, err
 	}
 	s := &session{
-		cfg:      cfg,
-		tf:       cfg.Torrent,
-		store:    store,
-		down:     limiter(cfg.DownloadLimit),
-		up:       limiter(cfg.UploadLimit),
-		pexEvery: pexInterval,
-		have:     make(peer.Bitfield, (len(verified)+7)/8),
-		pending:  map[int]work{},
-		fetching: map[int]work{},
-		fetchers: map[int]int{},
-		links:    map[*link]struct{}{},
+		cfg:          cfg,
+		tf:           cfg.Torrent,
+		store:        store,
+		down:         limiter(cfg.DownloadLimit),
+		up:           limiter(cfg.UploadLimit),
+		pexEvery:     pexInterval,
+		rechokeEvery: rechokeInterval,
+		have:         make(peer.Bitfield, (len(verified)+7)/8),
+		pending:      map[int]work{},
+		fetching:     map[int]work{},
+		fetchers:     map[int]int{},
+		links:        map[*link]struct{}{},
 	}
 	for i, ok := range verified {
 		if ok {
@@ -210,6 +212,7 @@ func Download(ctx context.Context, cfg Config) error {
 	defer workers.Wait()
 	defer cancel()
 	s.listen(ctx, &serving)
+	s.startChoker(ctx, &serving)
 
 	peers := newPool(cfg.MaxPeers)
 	launch := func(addrs []netip.AddrPort) {
@@ -274,6 +277,7 @@ func Seed(ctx context.Context, cfg Config) error {
 	}
 	var serving sync.WaitGroup
 	s.listen(ctx, &serving)
+	s.startChoker(ctx, &serving)
 	<-ctx.Done()
 	serving.Wait()
 	return nil

@@ -32,6 +32,11 @@ type link struct {
 	interested bool
 	outbox     chan *peer.Message
 	lastSent   atomic.Int64
+
+	peerInterested atomic.Bool
+	wantUnchoke    atomic.Bool
+	received       atomic.Int64
+	sent           atomic.Int64
 }
 
 // register before the bitfield snapshot; queued haves wait until the bitfield is sent
@@ -155,6 +160,9 @@ func (l *link) loop(ctx context.Context, msgs <-chan *peer.Message, gone <-chan 
 	var chokedSince time.Time
 
 	for {
+		if l.syncChoke() != nil {
+			return
+		}
 		if downloading {
 			if l.updateInterest() != nil {
 				return
@@ -186,6 +194,7 @@ func (l *link) loop(ctx context.Context, msgs <-chan *peer.Message, gone <-chan 
 				if err != nil {
 					return
 				}
+				l.received.Add(int64(len(block.Data)))
 				complete, err := cur.block(block, time.Now())
 				if err != nil || cur.cancelLost(l.send) != nil || l.s.down.WaitN(ctx, len(block.Data)) != nil {
 					return
@@ -249,6 +258,20 @@ func (l *link) loop(ctx context.Context, msgs <-chan *peer.Message, gone <-chan 
 	}
 }
 
+// the choker decides, the link tells the peer: only this goroutine writes choke state to the socket
+func (l *link) syncChoke() error {
+	want := l.wantUnchoke.Load()
+	if want != l.choking {
+		return nil
+	}
+	l.choking = !want
+	id := peer.Choke
+	if want {
+		id = peer.Unchoke
+	}
+	return l.send(&peer.Message{ID: id})
+}
+
 func (l *link) updateInterest() error {
 	want := l.s.wants(l.c.Bitfield)
 	if want == l.interested {
@@ -265,15 +288,13 @@ func (l *link) updateInterest() error {
 func (l *link) handle(ctx context.Context, m *peer.Message) error {
 	switch m.ID {
 	case peer.Interested:
-		if l.choking {
-			l.choking = false
-			return l.send(&peer.Message{ID: peer.Unchoke})
-		}
+		l.peerInterested.Store(true)
+		l.s.offerSlot(l)
+		return l.syncChoke()
 	case peer.NotInterested:
-		if !l.choking {
-			l.choking = true
-			return l.send(&peer.Message{ID: peer.Choke})
-		}
+		l.peerInterested.Store(false)
+		l.wantUnchoke.Store(false)
+		return l.syncChoke()
 	case peer.Request:
 		return l.serve(ctx, m)
 	case peer.Extended:
@@ -304,5 +325,6 @@ func (l *link) serve(ctx context.Context, m *peer.Message) error {
 		return err
 	}
 	l.s.uploaded.Add(int64(len(data)))
+	l.sent.Add(int64(len(data)))
 	return l.send(peer.NewPiece(req.Index, req.Begin, data))
 }
