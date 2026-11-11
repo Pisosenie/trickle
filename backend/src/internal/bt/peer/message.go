@@ -100,8 +100,8 @@ func NewHave(index int) *Message {
 }
 
 func ParseHave(m *Message) (int, error) {
-	if m.ID != Have || len(m.Payload) != 4 {
-		return 0, fmt.Errorf("%w: malformed have", ErrProtocol)
+	if (m.ID != Have && m.ID != AllowedFast) || len(m.Payload) != 4 {
+		return 0, fmt.Errorf("%w: malformed %v", ErrProtocol, m.ID)
 	}
 	return int(binary.BigEndian.Uint32(m.Payload)), nil
 }
@@ -153,4 +153,8 @@ func NewCancel(index, begin, length int) *Message {
 
 func NewReject(index, begin, length int) *Message {
 	return &Message{ID: Reject, Payload: NewRequest(index, begin, length).Payload}
+}
+
+func NewAllowedFast(index int) *Message {
+	return &Message{ID: AllowedFast, Payload: NewHave(index).Payload}
 }

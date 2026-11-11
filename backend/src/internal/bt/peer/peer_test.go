@@ -163,6 +163,12 @@ func TestBitfield(t *testing.T) {
 	if rest.Count() != 8 || rest.Has(0) || rest.Has(9) || full.Count() != 10 {
 		t.Fatalf("Minus = %08b, original %08b", rest, full)
 	}
+	if less := full.Without(3); less.Has(3) || !full.Has(3) || less.Count() != 9 {
+		t.Fatalf("Without(3) = %08b, original %08b", less, full)
+	}
+	if both := full.And(Bitfield{0b0110_0000}); len(both) != 1 || both.Count() != 2 || !both.Has(1) || !both.Has(2) {
+		t.Fatalf("And = %08b", both)
+	}
 }
 
 func fakePeer(t *testing.T, infoHash [20]byte, script ...*Message) net.Conn {
@@ -196,6 +202,7 @@ func TestConnTracksPeerState(t *testing.T) {
 	if !c.Choked || c.PeerID[1] != 'F' {
 		t.Fatalf("fresh connection: %+v", c)
 	}
+	c.Pieces = 8
 	for range 3 {
 		if _, err := c.Read(); err != nil {
 			t.Fatal(err)

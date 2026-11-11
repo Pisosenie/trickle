@@ -113,6 +113,7 @@ func (s *session) runLink(ctx context.Context, c *peer.Conn, outgoing bool, addr
 	if c.PeerID == s.cfg.PeerID {
 		return
 	}
+	c.Pieces = len(s.tf.Pieces)
 	stop := context.AfterFunc(ctx, func() { c.Close() })
 	defer stop()
 
@@ -168,12 +169,14 @@ func (l *link) loop(ctx context.Context, msgs <-chan *peer.Message, gone <-chan 
 			if l.updateInterest() != nil {
 				return
 			}
-			if cur == nil && l.interested && !l.c.Choked {
-				if w, ok := l.s.assign(l.theirs()); ok {
-					cur = newProgress(w, time.Now())
+			if cur == nil && l.interested {
+				if has := l.askable(); has.Count() > 0 {
+					if w, ok := l.s.assign(has); ok {
+						cur = newProgress(w, time.Now())
+					}
 				}
 			}
-			if cur != nil && !l.c.Choked && cur.request(l.send) != nil {
+			if cur != nil && l.c.MayRequest(cur.w.index) && cur.request(l.send) != nil {
 				return
 			}
 		}
@@ -248,7 +251,7 @@ func (l *link) loop(ctx context.Context, msgs <-chan *peer.Message, gone <-chan 
 			if cur != nil && now.Sub(cur.lastData) > pieceTimeout || now.Sub(lastHeard) > idleTimeout {
 				return
 			}
-			if l.outgoing && l.interested && l.c.Choked {
+			if l.outgoing && l.interested && l.starved(cur) {
 				if chokedSince.IsZero() {
 					chokedSince = now
 				} else if now.Sub(chokedSince) > unchokeWait {
@@ -298,6 +301,21 @@ func (l *link) theirs() peer.Bitfield {
 		return bf
 	}
 	return bf.Minus(l.refused)
+}
+
+// choked with nothing we may still ask for
+func (l *link) starved(cur *pieceProgress) bool {
+	if cur == nil {
+		return l.c.Choked
+	}
+	return !l.c.MayRequest(cur.w.index)
+}
+
+func (l *link) askable() peer.Bitfield {
+	if l.c.Choked {
+		return l.theirs().And(l.c.Allowed)
+	}
+	return l.theirs()
 }
 
 func (l *link) updateInterest() error {

@@ -23,6 +23,15 @@ func (b Bitfield) With(index int) Bitfield {
 	return next
 }
 
+func (b Bitfield) Without(index int) Bitfield {
+	if !b.Has(index) {
+		return b
+	}
+	next := slices.Clone(b)
+	next[index/8] &^= 1 << (7 - index%8)
+	return next
+}
+
 func (b Bitfield) Count() int {
 	n := 0
 	for _, c := range b {
@@ -43,6 +52,14 @@ func (b Bitfield) Minus(other Bitfield) Bitfield {
 	next := slices.Clone(b)
 	for i := range min(len(next), len(other)) {
 		next[i] &^= other[i]
+	}
+	return next
+}
+
+func (b Bitfield) And(other Bitfield) Bitfield {
+	next := make(Bitfield, min(len(b), len(other)))
+	for i := range next {
+		next[i] = b[i] & other[i]
 	}
 	return next
 }

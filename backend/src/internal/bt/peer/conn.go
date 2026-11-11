@@ -13,9 +13,11 @@ type Conn struct {
 	PeerID     [20]byte
 	Bitfield   Bitfield
 	All        bool
+	Allowed    Bitfield
 	Choked     bool
 	Extensions bool
 	Fast       bool
+	Pieces     int
 }
 
 func Dial(ctx context.Context, addr netip.AddrPort, infoHash, peerID [20]byte) (*Conn, error) {
@@ -105,6 +107,9 @@ func (c *Conn) Apply(m *Message) error {
 	case Unchoke:
 		c.Choked = false
 	case BitfieldMsg:
+		if c.Pieces > 0 && len(m.Payload) != (c.Pieces+7)/8 {
+			return fmt.Errorf("%w: bitfield of %d bytes for %d pieces", ErrProtocol, len(m.Payload), c.Pieces)
+		}
 		c.Bitfield = Bitfield(m.Payload)
 		c.All = false
 	case HaveAll:
@@ -113,17 +118,50 @@ func (c *Conn) Apply(m *Message) error {
 		c.All = false
 		c.Bitfield = nil
 	case Have:
-		index, err := ParseHave(m)
+		index, ok, err := c.piece(m)
+		if ok {
+			c.Bitfield = c.Bitfield.With(index)
+		}
+		return err
+	case AllowedFast:
+		index, ok, err := c.piece(m)
+		if ok {
+			c.Allowed = c.Allowed.With(index)
+		}
+		return err
+	case Reject:
+		req, err := ParseRequest(m)
 		if err != nil {
 			return err
 		}
-		c.Bitfield = c.Bitfield.With(index)
+		if c.Choked {
+			c.Allowed = c.Allowed.Without(req.Index)
+		}
 	}
 	return nil
 }
 
+// until the piece count is known (while fetching metadata) nothing tracks pieces and an index can't be checked
+func (c *Conn) piece(m *Message) (int, bool, error) {
+	index, err := ParseHave(m)
+	switch {
+	case err != nil:
+		return 0, false, err
+	case c.Pieces == 0:
+		return 0, false, nil
+	case index >= c.Pieces:
+		return 0, false, fmt.Errorf("%w: piece %d of %d", ErrProtocol, index, c.Pieces)
+	}
+	return index, true, nil
+}
+
 func (c *Conn) Has(index int) bool {
 	return c.All || c.Bitfield.Has(index)
+}
+
+// a choking peer still takes requests for the pieces it allowed fast
+func (c *Conn) MayRequest(index int) bool {
+	return !c.Choked || c.Allowed.Has(index)
 }
 
 func (c *Conn) RemoteAddr() netip.AddrPort {

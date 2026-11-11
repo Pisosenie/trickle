@@ -13,8 +13,10 @@ import (
 	"trickle/internal/bt/torrentfile"
 )
 
-// fastFake speaks the fast extension: have all, unchoke, then hands every request to answer
-func fastFake(t *testing.T, fx fixture, answer func(nc net.Conn, req peer.BlockRequest) bool) netip.AddrPort {
+var seedsAndUnchokes = []*peer.Message{{ID: peer.HaveAll}, {ID: peer.Unchoke}}
+
+// fastFake speaks the fast extension: it sends greet, then hands every request to answer
+func fastFake(t *testing.T, fx fixture, greet []*peer.Message, answer func(nc net.Conn, req peer.BlockRequest) bool) netip.AddrPort {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -33,8 +35,9 @@ func fastFake(t *testing.T, fx fixture, answer func(nc net.Conn, req peer.BlockR
 		hs := peer.Handshake{InfoHash: fx.tf.InfoHash, PeerID: [20]byte{'-', 'F', 'A'}}
 		hs.Reserved[7] |= 0x04
 		nc.Write(hs.Bytes())
-		nc.Write((&peer.Message{ID: peer.HaveAll}).Bytes())
-		nc.Write((&peer.Message{ID: peer.Unchoke}).Bytes())
+		for _, m := range greet {
+			nc.Write(m.Bytes())
+		}
 		for {
 			m, err := peer.ReadMessage(nc)
 			if err != nil {
@@ -67,7 +70,7 @@ func TestRefusedPieceGoesToAnotherPeer(t *testing.T) {
 	var asked atomic.Int32
 	refused := make(chan struct{})
 	var once sync.Once
-	stubborn := fastFake(t, fx, func(nc net.Conn, req peer.BlockRequest) bool {
+	stubborn := fastFake(t, fx, seedsAndUnchokes, func(nc net.Conn, req peer.BlockRequest) bool {
 		if req.Index != 0 {
 			return write(nc, blockOf(fx, req))
 		}
@@ -103,7 +106,7 @@ func TestFastChokeKeepsUnrejectedRequests(t *testing.T) {
 		waiting   int
 		phase     int
 	)
-	keeper := fastFake(t, fx, func(nc net.Conn, req peer.BlockRequest) bool {
+	keeper := fastFake(t, fx, seedsAndUnchokes, func(nc net.Conn, req peer.BlockRequest) bool {
 		switch phase {
 		case 0:
 			kept, phase = req, 1
@@ -226,5 +229,66 @@ func TestRejectOfACancelKeepsTheRetry(t *testing.T) {
 	}
 	if p.rejected(first) || p.rejected(peer.BlockRequest{Index: 3}) {
 		t.Fatal("stray rejects must change nothing")
+	}
+}
+
+func grantingAll(fx fixture) []*peer.Message {
+	greet := []*peer.Message{{ID: peer.HaveAll}}
+	for i := range fx.tf.Pieces {
+		greet = append(greet, peer.NewAllowedFast(i))
+	}
+	return greet
+}
+
+func TestAllowedFastPiecesFlowWhileChoked(t *testing.T) {
+	fx := newFixture(t, false)
+	never := fastFake(t, fx, grantingAll(fx), func(nc net.Conn, req peer.BlockRequest) bool {
+		return write(nc, blockOf(fx, req))
+	})
+	out := t.TempDir()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := Download(ctx, Config{Torrent: fx.tf, PeerID: ourID, Peers: []netip.AddrPort{never}, Dir: out}); err != nil {
+		t.Fatalf("every piece was allowed fast, the choke should not matter: %v", err)
+	}
+	fx.check(t, out)
+}
+
+// the peer takes piece 0 back with a reject while choking; we wait for the unchoke instead of asking again and again
+func TestWithdrawnAllowedFastWaitsForUnchoke(t *testing.T) {
+	fx := newFixture(t, false)
+	var (
+		mu       sync.Mutex
+		unchoked atomic.Bool
+		asked    atomic.Int32
+		once     sync.Once
+	)
+	send := func(nc net.Conn, m *peer.Message) bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return write(nc, m)
+	}
+	peerAddr := fastFake(t, fx, grantingAll(fx), func(nc net.Conn, req peer.BlockRequest) bool {
+		if req.Index != 0 || unchoked.Load() {
+			return send(nc, blockOf(fx, req))
+		}
+		asked.Add(1)
+		once.Do(func() {
+			time.AfterFunc(300*time.Millisecond, func() {
+				unchoked.Store(true)
+				send(nc, &peer.Message{ID: peer.Unchoke})
+			})
+		})
+		return send(nc, peer.NewReject(req.Index, req.Begin, req.Length))
+	})
+	out := t.TempDir()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := Download(ctx, Config{Torrent: fx.tf, PeerID: ourID, Peers: []netip.AddrPort{peerAddr}, Dir: out}); err != nil {
+		t.Fatal(err)
+	}
+	fx.check(t, out)
+	if n := asked.Load(); n > maxBacklog {
+		t.Fatalf("piece 0 was asked %d times while the peer was refusing it", n)
 	}
 }
