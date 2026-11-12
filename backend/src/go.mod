@@ -3,7 +3,9 @@ module trickle
 go 1.24.0
 
 require (
+	github.com/anacrolix/dht/v2 v2.23.0
 	github.com/anacrolix/generics v0.1.1-0.20251125230353-15d98d46693b
+	github.com/anacrolix/go-libutp v1.3.2
 	github.com/anacrolix/torrent v1.61.0
 	github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e
 	golang.org/x/time v0.14.0
@@ -14,9 +16,7 @@ require (
 	github.com/alecthomas/atomic v0.1.0-alpha2 // indirect
 	github.com/anacrolix/btree v0.0.0-20251201064447-d86c3fa41bd8 // indirect
 	github.com/anacrolix/chansync v0.7.0 // indirect
-	github.com/anacrolix/dht/v2 v2.23.0 // indirect
 	github.com/anacrolix/envpprof v1.4.0 // indirect
-	github.com/anacrolix/go-libutp v1.3.2 // indirect
 	github.com/anacrolix/log v0.17.1-0.20251118025802-918f1157b7bb // indirect
 	github.com/anacrolix/missinggo v1.3.0 // indirect
 	github.com/anacrolix/missinggo/perf v1.0.0 // indirect
